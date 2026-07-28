@@ -1,0 +1,27 @@
+[project]
+name = "simple-agentic-evals"
+version = "0.10.0"
+description = "A thin, server-only client for agentic evaluations (currently EoG and ALE): the Evolving-Benchmarks Evaluation Service hosts the environment, the provided agent harnesses (react_agent / acp_codex_agent), and the grader (BYOA optional)."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["httpx>=0.27", "pydantic>=2"]
+
+# The provided harnesses (react_agent / acp_codex_agent) run on the service, so
+# the base install is only the HTTP client plus ``pydantic``, which the ACP wire
+# types in ``simple_agentic_evals.acp`` are built on. The ``openai`` extra is
+# only for the bring-your-own-agent examples that call OpenAI directly (the SDK
+# itself never imports it).
+[project.optional-dependencies]
+openai = ["openai>=1.0"]
+
+# stdio<->HTTP MCP bridge (used by the service/harness). Also runnable as
+# `python -m simple_agentic_evals.mcp_bridge`.
+[project.scripts]
+simple-agentic-evals-mcp-bridge = "simple_agentic_evals.mcp_bridge:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["simple_agentic_evals", "simple_agentic_evals.acp"]
