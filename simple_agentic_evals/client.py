@@ -450,6 +450,7 @@ class EvalClient:
         label: str = "manual",
         model: str | None = None,
         api_key: str | None = None,
+        root_only: bool = False,
     ) -> dict[str, Any]:
         """Ask Codex to distil the rollouts in a memory home into its memory file.
 
@@ -460,12 +461,18 @@ class EvalClient:
         for an hour, which a benchmark run never does -- so the caller consolidates
         at a point that means something to it, such as the end of a training stage.
 
+        ``root_only`` builds the memory out of the orchestrator's own rollouts
+        and leaves out the specialists', to go with ``memory_main_only`` on the
+        run itself: that one decides who READS the memory, this one what is in
+        it.  Setting either alone gives an orchestrator reading a memory made
+        of sessions it never ran, or specialists reading one made without them.
+
         Session-less and safe to call between runs.  Returns the service's report
         (``exit_code``, ``summary_bytes_before/after``, ``wrote_memory``).
         """
         return self._post("/v1/memory/consolidate", {
             "memory_key": memory_key, "label": label,
-            "model": model, "api_key": api_key,
+            "model": model, "api_key": api_key, "root_only": root_only,
         })
 
     # -- long agent runs: submit as a background job, then poll ------------- #

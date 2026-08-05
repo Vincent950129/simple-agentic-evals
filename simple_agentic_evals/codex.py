@@ -124,6 +124,7 @@ def acp_codex_agent(
     prompt_suffix: str | None = None,
     sandbox_env: dict[str, str] | None = None,
     memory_key: str | None = None,
+    memory_main_only: bool = False,
 ) -> CodexRun:
     """Run **Codex** (ACP) against a task -- on the service.
 
@@ -159,6 +160,11 @@ def acp_codex_agent(
     ``CODEX_HOME`` it keeps for that key, so Codex accumulates memory across every
     trial you send with the same key. Codex writes the memory itself; pass a key
     that is stable for one experiment and unique across experiments.
+
+    ``memory_main_only`` keeps that memory to the multi-agent orchestrator: each
+    specialist it spawns is given Codex's per-agent ``use_memories = false``, so
+    only the agent doing the routing is informed by earlier trials. Ignored
+    without ``memory_key``.
     """
     task.start()
     is_ale = (task.benchmark or "").lower() == "ale"
@@ -190,6 +196,8 @@ def acp_codex_agent(
         body["sandbox_env"] = dict(sandbox_env)
     if memory_key:
         body["memory_key"] = memory_key
+        if memory_main_only:
+            body["memory_main_only"] = True
     if transport is not None:
         body["transport"] = transport
     if mcp_only is not None:
