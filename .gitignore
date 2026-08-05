@@ -15,3 +15,9 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Server runtime state (per-session ALE workspaces, telemetry, tunnel analytics).
+server/eval_service/.ale_workspaces/
+server/eval_service/logs/
+server/.tunnel_analytics/
+server/bin/

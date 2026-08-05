@@ -1,0 +1,166 @@
+# Evolving-Benchmarks Evaluation Service -- Kubernetes deployment.
+#
+# Written after a production incident: the pod wedged with ~616,000 unreaped
+# zombies (mostly `bwrap`, the sandbox Codex forks per tool call) because PID 1
+# was `sleep 60d`, which never calls wait(). The PID limit (629,145) was
+# exhausted, every fork() failed with "Resource temporarily unavailable", and
+# because the pod had no probes Kubernetes still reported Ready.
+#
+# Four things prevent a repeat; they are marked [1]..[4] below.
+---
+apiVersion: apps/v1
+# [4] A Deployment, not a bare Pod. The wedged pod was standalone, so deleting
+#     it would NOT have recreated it -- recovery meant a human rebuilding it.
+kind: Deployment
+metadata:
+  name: eval-service
+  labels:
+    app: eval-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: eval-service
+  strategy:
+    type: Recreate          # single writer against the shared /export mount
+  template:
+    metadata:
+      labels:
+        app: eval-service
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: eval-service
+          image: REPLACE_ME/eval-service:latest
+
+          # [1] tini as PID 1 -- the fix for the actual incident.
+          #     Orphaned descendants reparent to PID 1, which must call wait()
+          #     to clear them. `sleep`, `bash` and `python` never do; tini's
+          #     whole job is to. `-s` (subreaper) is required if tini is ever
+          #     NOT pid 1 (e.g. wrapped by an entrypoint) and harmless if it is.
+          #
+          #     If the image has no tini, drop a verified static binary next to
+          #     the checkout (v0.19.0, sha256
+          #     c5b0666b4cb676901f90dfcb37106783c5fe2077b04590973b885950611b30ee)
+          #     and point at it from the mounted volume:
+          #       command: ["/workspace/simple-agentic-evals/server/bin/tini", "-s", "--"]
+          command: ["/usr/bin/tini", "-s", "--"]
+          args: ["bash", "server/run.sh"]
+          workingDir: /workspace/simple-agentic-evals
+
+          ports:
+            - name: http
+              containerPort: 8077
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8077"
+            # The three trees the service reads live on the shared volume, not
+            # in the image (the ALE sandbox image alone is ~97 GB).
+            - name: EVAL_SERVICE_DATA_ROOT
+              value: /data/benchmarks
+            - name: EOG_ROOT
+              value: /data/reference/EnterpriseOps-Gym
+            - name: ALE_ROOT
+              value: /data/reference/agents-last-exam
+
+          # [2] Probes. The wedged pod had none, so Kubernetes reported Ready
+          #     for as long as `sleep` stayed alive -- which is forever.
+
+          # Boot walks the dataset tree on NFS, which is slow. Allow up to 5 min
+          # before liveness starts counting, without loosening the steady state.
+          startupProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 30
+
+          # Readiness gates traffic only; it must not restart the pod, because a
+          # long grading run can make the service briefly slow to answer.
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 4
+
+          # Liveness is deliberately `exec`, not `httpGet`. An exec probe has to
+          # fork() inside the container, so it fails precisely when the PID table
+          # is full -- the failure httpGet would miss, since uvicorn keeps
+          # answering on already-established connections while no new process can
+          # start. This is what turns the wedge into an automatic restart.
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "curl -sf --max-time 10 http://127.0.0.1:8077/v1/health >/dev/null"
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 20
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+            limits:
+              memory: 32Gi
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            # Agent runs are disk-heavy and short-lived; keep them off NFS.
+            - name: workdir
+              mountPath: /tmp/eval-work
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: eval-data-pvc   # datasets + the EOG and ALE checkouts
+        - name: workdir
+          emptyDir: {}
+
+---
+# [3] Give the service a stable in-cluster address. The wedged pod bound 3000
+#     and 8005 on loopback with no Service, so nothing could reach it by name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: eval-service
+spec:
+  selector:
+    app: eval-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+
+# ---------------------------------------------------------------------------
+# Node-level PID cap (cannot be set from this manifest)
+# ---------------------------------------------------------------------------
+# There is no `resources.limits.pids` in the pod spec. A per-pod PID ceiling is
+# a kubelet setting, so it goes in the node's KubeletConfiguration:
+#
+#     podPidsLimit: 8192
+#
+# The 629,145 limit we hit was effectively the node's whole PID space. A
+# per-pod cap means a leaking pod hits its own ceiling, fails its
+# liveness probe and restarts, instead of starving every other pod on the node.
+#
+# Verify on a running pod with:
+#     kubectl exec deploy/eval-service -- cat /sys/fs/cgroup/pids.max
+#
+# ---------------------------------------------------------------------------
+# Monitoring the leak directly
+# ---------------------------------------------------------------------------
+#     kubectl exec deploy/eval-service -- sh -c \
+#       'echo "zombies: $(ps -eo stat= | grep -c "^Z")  pids: $(cat /sys/fs/cgroup/pids.current)"'
+#
+# A healthy service holds near-zero zombies. Steady growth means something is
+# spawning children outside the process-group handling in ale_grader.
+# kill_process_tree() -- that is the regression to look for.

@@ -28,6 +28,9 @@ connect, pick a task, run a harness (or bring your own), and read the score.
   OpenAI-ready function specs; hand `task.mcp_servers` to any MCP client.
 - **Continual-learning metrics** — `ContinualMetrics` (ACC / BWT / FWT / forgetting).
 
+The service itself lives in [`server/`](server/README.md) — run your own if you
+want to host the gyms, the ALE sandbox and the graders yourself.
+
 ## Install
 
 The service **ships this SDK itself** at `GET /sdk`, so you can install it straight
@@ -255,6 +258,29 @@ for k, acc in enumerate(per_stage_scores):        # R[k][k] diagonal
     m.record(StageResult(eval_stage=k, adapt_stage=k, num_tasks=x, success_rate=acc))
 print(m.print_report())                           # ACC, BWT, FWT, forgetting
 ```
+
+## Running your own service
+
+Everything above talks to a hosted service. If you want to run it yourself —
+to point at your own gyms, add benchmarks, or keep evaluation inside your
+network — the server is in [`server/`](server/README.md):
+
+```bash
+pip install -r server/requirements.txt
+EOG_ROOT=/path/to/EnterpriseOps-Gym \
+ALE_ROOT=/path/to/agents-last-exam \
+EVAL_SERVICE_DATA_ROOT=/path/to/datasets \
+  bash server/run.sh                      # http://0.0.0.0:8077
+```
+
+```python
+client = EvalClient("http://localhost:8077")
+```
+
+It serves this SDK back at `GET /sdk` (built from the repo root on startup), so
+clients can `pip install` straight from your instance. See
+[`server/README.md`](server/README.md) for prerequisites, the endpoint
+reference, configuration, and deployment notes.
 
 ## API surface
 
