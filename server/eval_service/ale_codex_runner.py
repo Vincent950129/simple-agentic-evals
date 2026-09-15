@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from . import ale_docker_grader, ale_grader
+from .ale_verifier_capture import SIDECAR_ENV, merge_sidecar
 
 logger = logging.getLogger("eval_service.ale.codex")
 
@@ -36,15 +37,20 @@ _AGENTS_DIR = ALE_ROOT / "configs" / "agents"
 _DIRECT_CONFIG = _AGENTS_DIR / "codex_direct.yaml"      # skills/tools: direct OpenAI
 _AGENTS_CONFIG = _AGENTS_DIR / "codex_agents.yaml"      # agents: multi-agent V2 router
 
-# Total wall-clock ceiling for one ALE Codex run (sandbox boot + agent solve +
-# in-sandbox scorer). Reference parity: ale_run gives the agent phase 7200s
-# (_AGENT_WALL_S below) plus its own eval ceiling, so this end-to-end fallback adds
-# headroom for boot + grading on top. Callers normally pass an explicit timeout_s.
-RUN_TIMEOUT_SEC = int(os.environ.get("EVAL_SERVICE_ALE_CODEX_TIMEOUT_SEC", "9000"))
 # Wall budget handed to ale_run for the agent phase (the eval phase has its own
 # ceiling inside ale_run). Matches the reference default (ale_run
 # lifecycle._DEFAULT_TIMEOUT_S == example_exp.yaml wall_time_s == 7200s).
 _AGENT_WALL_S = int(os.environ.get("EVAL_SERVICE_ALE_CODEX_AGENT_WALL_SEC", "7200"))
+# Total wall-clock ceiling for one ALE Codex run (sandbox boot + agent solve +
+# in-sandbox scorer). Sized so ale_run always reaches its own cleanup first:
+# this is a background job, so waiting out its worst case costs a poll loop,
+# whereas cutting it short costs a stranded container. Callers normally pass a
+# shorter explicit timeout_s -- reap_containers below covers those.
+RUN_TIMEOUT_SEC = int(
+    os.environ.get("EVAL_SERVICE_ALE_CODEX_TIMEOUT_SEC")
+    or ale_grader.ale_run_outer_timeout(_AGENT_WALL_S)
+)
+DEFAULT_OPENAI_MODEL = os.environ.get("EVAL_SERVICE_OPENAI_MODEL", "gpt-5").strip() or "gpt-5"
 
 
 def availability() -> dict[str, Any]:
@@ -187,7 +193,7 @@ def _indent_block(text: str, pad: str = "    ") -> str:
 
 def _write_experiment(
     task: ale_grader.AleTask, agent_yaml: Path, *, exp_dir: Path,
-    prompt_suffix: str = "",
+    prompt_suffix: str = "", openai_api_key: str | None = None,
 ) -> tuple[Path, Path]:
     """Write the one-task ale_run experiment (+ task list). Returns
     ``(experiment_yaml, output_root)``.
@@ -208,8 +214,15 @@ def _write_experiment(
         encoding="utf-8",
     )
 
+    # ale_run loads ``secret_file`` with override=True. When the caller supplies
+    # an OpenAI key, omit that file and use the child environment so the key is
+    # never written into the task workspace. With no caller key, retain the
+    # installation's existing secret-file behavior.
     secret = ALE_ROOT / "secret" / ".env"
-    secret_line = f"secret_file: {_yaml_quote(str(secret))}\n" if secret.is_file() else ""
+    secret_line = (
+        f"secret_file: {_yaml_quote(str(secret))}\n"
+        if secret.is_file() and not openai_api_key else ""
+    )
 
     # Extended tasks need a privileged sandbox (DinD / Apptainer); everyone else
     # uses the stock (unprivileged) docker env config. Reuse the docker grader's
@@ -259,6 +272,7 @@ def run_codex_ale(
     ``{"ok": False, "reason": str, ...}`` (never raises for an expected failure).
     Blocking (shells out to ale_run/docker); call from a worker thread.
     """
+    model = model or DEFAULT_OPENAI_MODEL
     venv = ale_grader.venv_python()
     if venv is None:
         return {"ok": False, "reason": "ALE venv not found; cannot drive ale_run"}
@@ -278,9 +292,17 @@ def run_codex_ale(
     exp_dir.mkdir(parents=True, exist_ok=True)
     agent_yaml = _write_agent_config(exp_dir, model=model, multi_agent=multi_agent)
     exp_yaml, out_root = _write_experiment(
-        task, agent_yaml, exp_dir=exp_dir, prompt_suffix=prompt_suffix)
+        task, agent_yaml, exp_dir=exp_dir, prompt_suffix=prompt_suffix,
+        openai_api_key=openai_api_key)
 
     env = dict(os.environ)
+    verifier_sidecar = exp_dir / "verifier_result.json"
+    try:
+        verifier_sidecar.unlink()
+    except FileNotFoundError:
+        pass
+    env[SIDECAR_ENV] = str(verifier_sidecar)
+    env["EVAL_SERVICE_ALE_ROOT"] = str(ale_grader.ALE_ROOT)
     if openai_api_key:
         env["OPENAI_API_KEY"] = openai_api_key
     # ale_run's lifecycle passes these through to the sandbox: the specialist pool
@@ -292,7 +314,10 @@ def run_codex_ale(
     # ale_docker_grader.grade_via_docker for the rationale).
     env["ALE_DOCKER_ENDPOINT_MODE"] = ale_docker_grader._ENDPOINT_MODE
 
-    cmd = [str(venv), "-m", "ale_run", "run", str(exp_yaml)]
+    cmd = [
+        str(venv), str(ale_docker_grader._ALE_OVERLAY_LAUNCHER),
+        "run", str(exp_yaml),
+    ]
     budget = int(timeout_s or RUN_TIMEOUT_SEC)
     dt = f"{task.domain}/{task.task}"
     logger.info(
@@ -302,6 +327,11 @@ def run_codex_ale(
         "yes" if any(k.startswith("ALE_GUARD_") for k in staged_env) else "NO",
     )
     started = time.monotonic()
+    # Sampled before launch so the reaper can tell our sandbox container from one
+    # a concurrent run of the same task already owns.
+    containers_before = ale_grader.list_containers(
+        ale_grader.container_prefix(task.domain, task.task)
+    )
     # start_new_session: own process group, so a timeout kills ale_run *and* the
     # codex/bwrap descendants it spawned instead of orphaning them onto PID 1.
     try:
@@ -311,11 +341,29 @@ def run_codex_ale(
             start_new_session=True,
         )
     except Exception as e:  # noqa: BLE001
+        try:
+            verifier_sidecar.unlink()
+        except OSError:
+            pass
         return {"ok": False, "reason": f"ale_run launch failed: {type(e).__name__}: {e}"}
+    out = err = ""
+    timed_out = False
     try:
         out, err = proc.communicate(timeout=budget)
     except subprocess.TimeoutExpired:
-        ale_grader.kill_process_tree(proc)
+        timed_out = True
+        out, err = ale_grader.kill_process_tree(proc)
+    finally:
+        # A run that exited cleanly already deleted its container and this is a
+        # no-op; it is here to catch the ones that didn't, however they ended.
+        ale_grader.reap_containers(
+            task.domain, task.task, f"{out}\n{err}", containers_before,
+        )
+    if timed_out:
+        try:
+            verifier_sidecar.unlink()
+        except OSError:
+            pass
         return {
             "ok": False,
             "reason": f"ale-codex run exceeded {budget}s (sandbox boot + agent + scorer)",
@@ -323,8 +371,12 @@ def run_codex_ale(
         }
     latency_s = round(time.monotonic() - started, 3)
 
-    score = ale_docker_grader._find_unit_score(out_root, dt, variant_index=0)
-    if score is None:
+    grade = ale_docker_grader._find_unit_grade(out_root, dt, variant_index=0)
+    if grade is None:
+        try:
+            verifier_sidecar.unlink()
+        except OSError:
+            pass
         tail = "\n".join((err or out or "").strip().splitlines()[-8:])
         return {
             "ok": False,
@@ -334,13 +386,14 @@ def run_codex_ale(
             ),
             "latency_s": latency_s,
         }
+    grade = merge_sidecar(grade, verifier_sidecar, dt)
     # ale_run aggregates the sandbox agent's token/cost usage into run.json on
     # THIS host, and the stager's spawn tally lands under the unit's origin_log,
     # so both are readable here even though the Codex rollout stays in the sandbox.
     usage = ale_docker_grader.find_unit_usage(out_root, dt, variant_index=0)
     spawns = ale_docker_grader.find_unit_spawns(out_root, dt, variant_index=0)
     return {
-        "ok": True, "score": float(score), "latency_s": latency_s,
+        "ok": True, **grade, "latency_s": latency_s,
         "usage": usage, "n_subagent_spawns": spawns,
         # Where the raw tree lives, so GET .../run_artifacts can ship it back
         # before session teardown removes it.

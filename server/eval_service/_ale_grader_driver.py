@@ -34,6 +34,11 @@ import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
+try:
+    from ale_verifier_capture import invoke_with_capture
+except ImportError:  # Imported as eval_service._ale_grader_driver in tests.
+    from .ale_verifier_capture import invoke_with_capture
+
 RESULT_SENTINEL = "__ALE_RESULT__"
 
 
@@ -73,6 +78,11 @@ class LocalSession:
 
     async def list_dir(self, path: str) -> list[str]:
         p = Path(path)
+        if p.is_file():
+            # Match the real CUA provider: listing a file is an error.  Returning
+            # [] made evaluators that probe file-vs-directory treat ordinary
+            # files as empty directories (notably CVRP's reference manifest).
+            raise NotADirectoryError(path)
         return sorted(c.name for c in p.iterdir()) if p.is_dir() else []
 
     async def run_command(self, *args, **kwargs):
@@ -142,6 +152,45 @@ def _find_evaluate(mod, split: str):
     return candidates[0]
 
 
+def _normalize_evaluate_result(raw) -> dict:
+    """Preserve ALE's aggregate plus any component-verifier payload.
+
+    This mirrors ``ale_run.tasks.driver.TaskDriver.evaluate``: a list's first
+    value is the official task score and the full list remains ``raw_scores``.
+    Dict-returning evaluators may additionally publish named
+    ``per_verifier``/``verifier_results`` records.
+    """
+    if isinstance(raw, dict):
+        out = dict(raw)
+        values = out.get("raw_scores")
+        if not isinstance(values, (list, tuple)):
+            values = []
+        if out.get("score") is None:
+            if values:
+                out["score"] = values[0]
+            else:
+                explicit = out.get("per_verifier") or out.get("verifier_results")
+                if isinstance(explicit, dict):
+                    explicit = list(explicit.values())
+                if isinstance(explicit, (list, tuple)) and explicit:
+                    first = explicit[0]
+                    out["score"] = (
+                        first.get("score", first.get("actual"))
+                        if isinstance(first, dict) else first
+                    )
+        if not values and out.get("score") is not None:
+            out["raw_scores"] = [out["score"]]
+        return out
+    if isinstance(raw, (list, tuple)):
+        values = [float(value) for value in raw]
+        return {
+            "score": values[0] if values else 0.0,
+            "raw_scores": values,
+        }
+    score = float(raw)
+    return {"score": score, "raw_scores": [score]}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ale-root", required=True)
@@ -184,7 +233,9 @@ def main() -> int:
             raised: Exception | None = None
             raw = None
             try:
-                raw = asyncio.run(evfn(cfg_ns, session))
+                raw, verifier_payload = asyncio.run(invoke_with_capture(
+                    evfn, f"{args.domain}/{args.task}", cfg_ns, session,
+                ))
             except Exception as exc:  # noqa: BLE001
                 raised = exc
             # If the grader touched run_command (whether it swallowed the error
@@ -199,15 +250,12 @@ def main() -> int:
             elif raised is not None:
                 raise raised
             else:
-                if isinstance(raw, (list, tuple)):
-                    vals = [float(x) for x in raw]
-                else:
-                    vals = [float(raw)]
-                score = sum(vals) / len(vals) if vals else 0.0
+                normalized = _normalize_evaluate_result(raw)
                 out = {
                     "ok": True,
-                    "score": score,
-                    "raw_scores": vals,
+                    **normalized,
+                    "per_verifier": verifier_payload["per_verifier"],
+                    "verifier_registry_version": verifier_payload["registry_version"],
                     "output_file": meta.get("output_file"),
                 }
     except Exception as exc:  # noqa: BLE001
@@ -217,7 +265,7 @@ def main() -> int:
             "trace": traceback.format_exc(limit=6),
         }
 
-    print(RESULT_SENTINEL, json.dumps(out))
+    print(RESULT_SENTINEL, json.dumps(out, default=str))
     return 0
 
 

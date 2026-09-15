@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from . import ale_grader
+from .ale_verifier_capture import SIDECAR_ENV, merge_sidecar
 
 logger = logging.getLogger("eval_service.ale.docker")
 
@@ -37,6 +38,7 @@ ALE_ROOT = ale_grader.ALE_ROOT
 # The dedicated PYTHONPATH root that holds *only* the ``ale_byoa_agent`` package
 # (so importing it inside the ALE venv can't shadow a stdlib / task module).
 _AGENT_PKG_ROOT = (Path(__file__).resolve().parent / "_ale_agent")
+_ALE_OVERLAY_LAUNCHER = Path(__file__).resolve().parent / "_ale_runtime_overlay" / "launch.py"
 _AGENT_CLASS = "ale_byoa_agent.deployer.ByoaDeployer"
 _DOCKER_ENV_CONFIG = ALE_ROOT / "configs" / "environments" / "docker.yaml"
 _DOCKER_SUPPORT_FILE = ALE_ROOT / "selected_tasks" / "docker_support.txt"
@@ -70,6 +72,11 @@ _DIND_MODE = os.environ.get("EVAL_SERVICE_ALE_DOCKER_DIND", "auto").strip().lowe
 _MODE = os.environ.get("EVAL_SERVICE_ALE_DOCKER", "auto").strip().lower()
 # Per-grade ceiling: container boot (~1-2 min for cua-ready) + task setup + the
 # in-sandbox scorer. Generous by default; override for slow scorers.
+# Deliberately *below* ale_grader.ale_run_outer_timeout(_AGENT_WALL_S), unlike
+# the codex path: /grade answers a synchronous request, so a client waiting out
+# ale_run's multi-hour worst case is a worse outcome than cutting the grade
+# short. That trade is only safe because reap_containers() cleans up after the
+# kill -- raise this if slow scorers start timing out, not to avoid leaks.
 GRADE_TIMEOUT_SEC = int(os.environ.get("EVAL_SERVICE_ALE_DOCKER_TIMEOUT_SEC", "2400"))
 # Wall budget handed to ale_run for the (no-LLM) agent phase. The eval phase has
 # its own ceiling inside ale_run, so this only bounds our fast staging step.
@@ -365,12 +372,16 @@ def find_unit_spawns(
     return None
 
 
-def _find_unit_score(out_root: Path, task_id: str, variant_index: int = 0) -> float | None:
-    """Read the unit's ``[0,1]`` score from ale_run's ``eval_result.json``.
+def _find_unit_grade(
+    out_root: Path, task_id: str, variant_index: int = 0,
+) -> dict[str, Any] | None:
+    """Read the unit's aggregate and component scores from ``eval_result.json``.
 
     ale_run writes results under ``<root>/<exp>/<agent>/<model>/<slug>/v<i>/<ts>/``;
-    we match the task slug + ``v<i>`` segment and take the newest run. Falls back
-    to ``run.json``'s score. Returns None when no scored result is found.
+    we match the task slug + ``v<i>`` segment and take the newest run. Newer
+    runners preserve ``raw_scores`` and named ``per_verifier`` records; older
+    artifacts remain compatible through their aggregate ``score``. Falls back
+    to ``run.json`` when needed.
     """
     def _newest(name: str) -> list[Path]:
         return _unit_files(out_root, task_id, name, variant_index)
@@ -382,7 +393,11 @@ def _find_unit_score(out_root: Path, task_id: str, variant_index: int = 0) -> fl
             continue
         s = rec.get("score")
         if isinstance(s, (int, float)):
-            return float(s)
+            result = dict(rec)
+            result["score"] = float(s)
+            if not isinstance(result.get("raw_scores"), list):
+                result["raw_scores"] = [float(s)]
+            return result
     for rj in _newest("run.json"):
         try:
             rec = json.loads(rj.read_text(encoding="utf-8"))
@@ -390,8 +405,15 @@ def _find_unit_score(out_root: Path, task_id: str, variant_index: int = 0) -> fl
             continue
         for key in ("score", "final_score"):
             if isinstance(rec.get(key), (int, float)):
-                return float(rec[key])
+                score = float(rec[key])
+                return {"score": score, "raw_scores": [score]}
     return None
+
+
+def _find_unit_score(out_root: Path, task_id: str, variant_index: int = 0) -> float | None:
+    """Backward-compatible aggregate-only view of :func:`_find_unit_grade`."""
+    result = _find_unit_grade(out_root, task_id, variant_index)
+    return float(result["score"]) if result is not None else None
 
 
 def grade_via_docker(
@@ -419,6 +441,13 @@ def grade_via_docker(
     exp_yaml, out_root = _write_experiment(task, output_dir_override=output_dir_override)
 
     env = dict(os.environ)
+    verifier_sidecar = exp_yaml.parent / "verifier_result.json"
+    try:
+        verifier_sidecar.unlink()
+    except FileNotFoundError:
+        pass
+    env[SIDECAR_ENV] = str(verifier_sidecar)
+    env["EVAL_SERVICE_ALE_ROOT"] = str(ALE_ROOT)
     existing_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = (
         str(_AGENT_PKG_ROOT) + (os.pathsep + existing_pp if existing_pp else "")
@@ -431,10 +460,15 @@ def grade_via_docker(
     # Set EVAL_SERVICE_ALE_DOCKER_ENDPOINT_MODE="" on Docker Desktop (mac/win),
     # where the host reaches containers only via localhost:<published-port>.
     env["ALE_DOCKER_ENDPOINT_MODE"] = _ENDPOINT_MODE
-    cmd = [str(venv), "-m", "ale_run", "run", str(exp_yaml)]
+    cmd = [str(venv), str(_ALE_OVERLAY_LAUNCHER), "run", str(exp_yaml)]
     logger.info(
         "docker-grade %s/%s: %s (timeout=%ds)",
         task.domain, task.task, " ".join(cmd), GRADE_TIMEOUT_SEC,
+    )
+    # Sampled before launch so the reaper can tell our sandbox container from one
+    # a concurrent grade of the same task already owns.
+    containers_before = ale_grader.list_containers(
+        ale_grader.container_prefix(task.domain, task.task)
     )
     # start_new_session: own process group, so a timeout kills ale_run *and* the
     # sandbox descendants it spawned instead of orphaning them onto PID 1.
@@ -445,18 +479,41 @@ def grade_via_docker(
             start_new_session=True,
         )
     except Exception as e:  # noqa: BLE001
+        try:
+            verifier_sidecar.unlink()
+        except OSError:
+            pass
         return {"ok": False, "reason": f"ale_run launch failed: {type(e).__name__}: {e}"}
+    out = err = ""
+    timed_out = False
     try:
         out, err = proc.communicate(timeout=GRADE_TIMEOUT_SEC)
     except subprocess.TimeoutExpired:
-        ale_grader.kill_process_tree(proc)
+        timed_out = True
+        out, err = ale_grader.kill_process_tree(proc)
+    finally:
+        # A grade that exited cleanly already deleted its container and this is a
+        # no-op; it is here to catch the ones that didn't, however they ended.
+        ale_grader.reap_containers(
+            task.domain, task.task, f"{out}\n{err}", containers_before,
+        )
+    if timed_out:
+        try:
+            verifier_sidecar.unlink()
+        except OSError:
+            pass
         return {
             "ok": False,
             "reason": f"docker grade exceeded {GRADE_TIMEOUT_SEC}s (sandbox boot + scorer)",
         }
 
-    score = _find_unit_score(out_root, f"{task.domain}/{task.task}", variant_index=0)
-    if score is None:
+    task_id = f"{task.domain}/{task.task}"
+    grade = _find_unit_grade(out_root, task_id, variant_index=0)
+    if grade is None:
+        try:
+            verifier_sidecar.unlink()
+        except OSError:
+            pass
         tail = "\n".join((err or out or "").strip().splitlines()[-6:])
         return {
             "ok": False,
@@ -465,4 +522,5 @@ def grade_via_docker(
                 f"Tail: {tail[-800:]}"
             ),
         }
-    return {"ok": True, "score": float(score), "raw_scores": [float(score)]}
+    grade = merge_sidecar(grade, verifier_sidecar, task_id)
+    return {"ok": True, **grade}

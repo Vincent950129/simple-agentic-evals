@@ -23,8 +23,15 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
 
-# Reuse the harness's TaskRow (parsed-object shape the verifier expects).
-from ._harness.dataset import TaskRow
+# Reuse the harness's TaskRow (parsed-object shape the verifier expects).  The
+# monorepo provides it as ``evovle_skills``; a standalone GitHub checkout uses
+# the small, upstream-derived compatibility copy in ``_harness``.
+try:  # pragma: no cover - which branch is used depends on deployment layout
+    from evovle_skills.src.dataset import TaskRow
+except ImportError:  # standalone checkout
+    from ._harness.dataset import TaskRow
+
+from . import adapter_registry, ale_manifest
 
 _THIS = Path(__file__).resolve()
 REPO_ROOT = _THIS.parent.parent  # .../server
@@ -60,8 +67,13 @@ def parse_version(version: Any) -> int | str:
 # --------------------------------------------------------------------------- #
 # Path resolution                                                             #
 # --------------------------------------------------------------------------- #
+def benchmark_root(dataset: str, benchmark: str) -> Path:
+    """Resolve a built-in or explicitly registered benchmark data root."""
+    return adapter_registry.dataset_root(dataset, benchmark) or DATA_ROOT / dataset / benchmark
+
+
 def _benchmark_root(dataset: str, benchmark: str) -> Path:
-    return DATA_ROOT / dataset / benchmark
+    return benchmark_root(dataset, benchmark)
 
 
 def is_flat(dataset: str, benchmark: str) -> bool:
@@ -136,30 +148,63 @@ def _count_lines(p: Path) -> int:
     return n
 
 
+def _n_rows(
+    dataset: str, benchmark: str, version: int, split: str, domain: str | None
+) -> int:
+    """Rows the catalog should advertise for one stage.
+
+    EOG counts lines. ALE has to count what survives the task-set filter, or
+    the advertised total would exceed what ``task_ids`` actually returns.
+    """
+    if not is_ale(benchmark):
+        return _count_lines(split_file(dataset, benchmark, version, split, domain))
+    try:
+        return len(_row_index(dataset, benchmark, version, split, domain))
+    except FileNotFoundError:
+        return 0
+
+
 def catalog() -> dict[str, Any]:
     """Enumerate everything available on disk, with test/train counts."""
     out: dict[str, Any] = {"data_root": str(DATA_ROOT), "datasets": []}
+    registered = adapter_registry.descriptors()
     for dataset in KNOWN_DATASETS:
-        droot = DATA_ROOT / dataset
-        if not droot.is_dir():
+        # A data directory alone is not an executable benchmark.  Only registry
+        # entries have a lifecycle/grader contract; legacy domain symlinks under
+        # data/<track>/ must not appear as fake benchmark adapters.
+        benchmark_names = {
+            name for name, item in registered.items()
+            if dataset in item.dataset_roots
+            or (name in (EOG_BENCHMARK, ALE_BENCHMARK)
+                and (DATA_ROOT / dataset / name).is_dir())
+        }
+        if not benchmark_names:
             continue
         ds_entry: dict[str, Any] = {"dataset": dataset, "benchmarks": []}
-        for benchmark in sorted(p.name for p in droot.iterdir() if p.is_dir()):
+        for benchmark in sorted(benchmark_names):
             flat = is_flat(dataset, benchmark)
+            adapter = registered.get(benchmark)
             b_entry: dict[str, Any] = {
                 "benchmark": benchmark,
                 "flat": flat,
                 "kind": "eog" if is_eog(benchmark) else ("ale" if is_ale(benchmark) else "unknown"),
                 "domains": [],
             }
+            if adapter:
+                b_entry.update(adapter.wire())
+                adapter_health = adapter_registry.health(adapter)
+                b_entry["health"] = adapter_health
+                b_entry["runnable"] = bool(
+                    b_entry.get("runnable") and adapter_health.get("ok")
+                )
             dom_list = [None] if flat else domains(dataset, benchmark)
             for dom in dom_list:
                 vers = versions(dataset, benchmark, dom)
                 vinfo = []
                 n_train_full = n_test_full = 0
                 for v in vers:
-                    nt = _count_lines(split_file(dataset, benchmark, v, "train", dom))
-                    ns = _count_lines(split_file(dataset, benchmark, v, "test", dom))
+                    nt = _n_rows(dataset, benchmark, v, "train", dom)
+                    ns = _n_rows(dataset, benchmark, v, "test", dom)
                     n_train_full += nt
                     n_test_full += ns
                     vinfo.append({"version": v, "n_train": nt, "n_test": ns})
@@ -216,12 +261,20 @@ def _iter_one_version(
     p = split_file(dataset, benchmark, version, split, domain)
     if not p.exists():
         raise FileNotFoundError(f"missing dataset file: {p}")
+    # ALE's version partition was built from all 152 tasks, so every stage file
+    # also lists the ones no published number counts (non-Linux, or excluded on
+    # this host). Withhold them here, the one place every listing funnels
+    # through, so catalog / task_ids / find_row can never disagree.
+    ale = is_ale(benchmark)
     with p.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            yield TaskRow.from_jsonl(_normalize_obj(json.loads(line)))
+            row = TaskRow.from_jsonl(_normalize_obj(json.loads(line)))
+            if ale and not ale_manifest.is_served(row.task_id):
+                continue
+            yield row
 
 
 def iter_rows(
@@ -273,7 +326,11 @@ def find_row(
         if r.task_id == task_id:
             return r
     stage = "full" if is_full_version(version) else f"v{version}"
-    raise KeyError(
-        f"task_id {task_id!r} not found in "
-        f"{dataset}/{benchmark}/{domain}/{stage}/{split}"
-    )
+    where = f"{dataset}/{benchmark}/{domain}/{stage}/{split}"
+    # An ALE id that exists on disk but is withheld would otherwise look like a
+    # typo. Say which filter took it, so the caller can tell "wrong id" from
+    # "right id, not measurable here".
+    withheld = ale_manifest.why_not(task_id) if is_ale(benchmark) else None
+    if withheld:
+        raise KeyError(f"task_id {task_id!r} is not served: {withheld}")
+    raise KeyError(f"task_id {task_id!r} not found in {where}")

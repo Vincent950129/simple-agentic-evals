@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import _render
-from .client import ServiceError
+from .client import ServiceError, resolve_openai_key
 
 __all__ = ["react_agent", "AgentRun"]
 
@@ -94,7 +94,7 @@ def react_agent(
     level = _render.normalize_verbose(verbose)
     body: dict[str, Any] = {
         "agent": "react",
-        "openai_api_key": api_key,
+        "openai_api_key": resolve_openai_key(api_key),
         "model": model,
         "restrict_to_selected_tools": bool(restrict_to_selected_tools),
         "timeout_s": int(timeout_s),

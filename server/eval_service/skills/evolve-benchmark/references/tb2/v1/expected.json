@@ -1,0 +1,14 @@
+{
+  "agents": {"capabilities": 17, "retained_tasks": 86, "versions": 5},
+  "bashlex": "0.18",
+  "content_hash": "7dd14ca35796ad7a91fdc08a825d53d298aed527cd67497317c78064fbef50a0",
+  "discovered_tasks": 89,
+  "harbor_commit": "d8cfe6b6fd463fc1f2a84abf8f1406f46e70c621",
+  "harbor_version": "0.23.0",
+  "python": "3.12.12",
+  "seed": 42,
+  "skills": {"capabilities": 26, "retained_tasks": 89, "versions": 5},
+  "source_commit": "2fd12b88aafdd04a52c298e3940bcb189f9766d6",
+  "tools": {"capabilities": 50, "retained_tasks": 86, "versions": 5},
+  "uv": "0.12.13"
+}

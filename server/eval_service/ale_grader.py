@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -25,8 +26,9 @@ import signal
 import subprocess
 import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 logger = logging.getLogger("eval_service.ale")
 
@@ -48,11 +50,102 @@ GRADE_TIMEOUT_SEC = int(os.environ.get("EVAL_SERVICE_ALE_GRADE_TIMEOUT_SEC", "60
 _RESULT_SENTINEL = "__ALE_RESULT__"
 
 
+def _numeric_score(value: Any) -> float | None:
+    """A finite verifier score, or ``None`` for non-numeric diagnostics."""
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    return score if math.isfinite(score) else None
+
+
+def verifier_records(
+    result: Mapping[str, Any], *, grading_path: str,
+) -> list[dict[str, Any]]:
+    """Normalize an ALE evaluator result into public per-verifier records.
+
+    ALE permits evaluators to return a rich dict, but the current upstream task
+    set normally returns ``[score]``.  Rich ``per_verifier`` /
+    ``verifier_results`` records are preserved verbatim where safe; otherwise
+    every value in ``raw_scores`` becomes a stable component record.  A task
+    exposing only one scalar is labelled as aggregate granularity rather than
+    pretending its natural-language rubric has separately measured checks.
+    """
+    explicit = result.get("per_verifier") or result.get("verifier_results")
+    if isinstance(explicit, Mapping):
+        explicit = [
+            ({"name": str(name), **dict(value)} if isinstance(value, Mapping)
+             else {"name": str(name), "score": value})
+            for name, value in explicit.items()
+        ]
+    if isinstance(explicit, (list, tuple)) and explicit:
+        records: list[dict[str, Any]] = []
+        for index, raw in enumerate(explicit):
+            item = dict(raw) if isinstance(raw, Mapping) else {"score": raw}
+            score = _numeric_score(item.get("score", item.get("actual")))
+            passed = item.get("passed")
+            if passed is None:
+                passed = score is not None and score >= SUCCESS_THRESHOLD
+            details = item.get("details")
+            records.append({
+                "name": str(item.get("name") or f"ale_verifier_{index + 1}"),
+                "passed": bool(passed),
+                "score": score,
+                "expected": item.get("expected", f">= {SUCCESS_THRESHOLD}"),
+                "actual": item.get("actual", score),
+                "comparison_type": str(
+                    item.get("comparison_type") or f"ale_component:{grading_path}"
+                ),
+                "description": str(
+                    item.get("description") or item.get("criterion") or ""
+                ),
+                "details": details,
+                "error": item.get("error"),
+            })
+        return records
+
+    values = result.get("raw_scores")
+    if not isinstance(values, (list, tuple)) or not values:
+        values = [result.get("score", 0.0)]
+    names = result.get("verifier_names") or result.get("score_names") or []
+    if not isinstance(names, (list, tuple)):
+        names = []
+    aggregate = len(values) == 1
+    records = []
+    for index, value in enumerate(values):
+        score = _numeric_score(value)
+        name = (
+            str(names[index]) if index < len(names) and names[index]
+            else "ale_score" if aggregate
+            else f"ale_verifier_{index + 1}"
+        )
+        records.append({
+            "name": name,
+            "passed": score is not None and score >= SUCCESS_THRESHOLD,
+            "score": score,
+            "expected": f">= {SUCCESS_THRESHOLD}",
+            "actual": round(score, 6) if score is not None else value,
+            "comparison_type": (
+                f"ale_score:{grading_path}" if aggregate
+                else f"ale_component:{grading_path}"
+            ),
+            "description": "",
+            "details": {
+                "granularity": "aggregate" if aggregate else "component",
+                **({"index": index} if not aggregate else {}),
+            },
+            "error": None,
+        })
+    return records
+
+
 class AleUnavailable(Exception):
     """ALE backend prerequisite missing (venv / task-data / driver)."""
 
 
-def kill_process_tree(proc: subprocess.Popen, *, drain_timeout: float = 30.0) -> None:
+def kill_process_tree(
+    proc: subprocess.Popen, *, drain_timeout: float = 30.0,
+) -> tuple[str, str]:
     """SIGKILL a timed-out child *and every descendant it spawned*.
 
     Only meaningful for children started with ``start_new_session=True``: they
@@ -63,7 +156,9 @@ def kill_process_tree(proc: subprocess.Popen, *, drain_timeout: float = 30.0) ->
 
     The drain afterwards is bounded: descendants inherit the stdout/stderr pipe
     write ends, so an unbounded ``communicate()`` can block forever even after
-    the child is dead.
+    the child is dead. It returns whatever the child managed to write before
+    dying (``("", "")`` if the pipes never drained), which is the only record
+    left of resources it never got to release -- see ``reap_containers``.
     """
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -73,11 +168,127 @@ def kill_process_tree(proc: subprocess.Popen, *, drain_timeout: float = 30.0) ->
         except ProcessLookupError:
             pass
     try:
-        proc.communicate(timeout=drain_timeout)
+        out, err = proc.communicate(timeout=drain_timeout)
+        return (out or ""), (err or "")
     except subprocess.TimeoutExpired:
         logger.warning("kill_process_tree: pipes still open after SIGKILL (pid=%s)", proc.pid)
     except Exception:  # noqa: BLE001 - never mask the original failure
         pass
+    return "", ""
+
+
+# --------------------------------------------------------------------------- #
+# ale_run sandbox containers                                                   #
+# --------------------------------------------------------------------------- #
+# ale_run removes its own sandbox container in a `finally` (we generate the
+# experiment with cleanup_mode: delete), but only if it lives long enough to
+# reach it -- a SIGKILL from our outer timeout skips that path and strands the
+# container, holding its CPU/memory reservation until an operator notices.
+# Two guards, because each covers what the other misses:
+#   * ale_run_outer_timeout() keeps our ceiling above ale_run's own worst case,
+#     so the graceful path wins whenever ale_run is merely slow;
+#   * reap_containers() removes what is left when it doesn't -- a caller-
+#     supplied budget shorter than that ceiling, or ale_run dying some other way.
+
+# ale_run's per-unit ceilings, from the reference checkout's
+# ale_run/orchestration/lifecycle.py. These bound *successive* phases: the three
+# post-agent artifact steps and then the eval both start after the agent's wall
+# budget is already spent, so the worst case is their sum, not their max.
+_ALE_EVAL_TIMEOUT_S = 7200
+_ALE_ARTIFACT_STEP_TIMEOUT_S = 1800
+_ALE_ARTIFACT_STEPS = 3
+# Container boot (~1-2 min to cua-ready), task staging, and cleanup itself.
+_ALE_OVERHEAD_S = 1200
+
+
+def ale_run_outer_timeout(agent_wall_s: int) -> int:
+    """Smallest outer budget that still lets ale_run clean up after itself.
+
+    A unit that hits every internal ceiling in turn exits on its own -- and
+    deletes its container -- at roughly this point. Kill it any earlier and the
+    container outlives us.
+    """
+    return (
+        int(agent_wall_s)
+        + _ALE_EVAL_TIMEOUT_S
+        + _ALE_ARTIFACT_STEPS * _ALE_ARTIFACT_STEP_TIMEOUT_S
+        + _ALE_OVERHEAD_S
+    )
+
+
+# ale_run's docker provider names containers "ale-<task-slug>-<hash8>", where
+# the slug is the task id lowercased with each non-alphanumeric run replaced by
+# "-" and then truncated (environments/providers/docker.py). The hash seeds off
+# time.time(), so we can reconstruct the prefix but never the full name.
+_CONTAINER_SLUG_MAX = 40
+_CONTAINER_RE = re.compile(r"\bale-[a-z0-9][a-z0-9-]*-[0-9a-f]{8}\b")
+_DOCKER_CLI_TIMEOUT_S = 60
+
+
+def container_prefix(domain: str, task: str) -> str:
+    """The ``ale-<slug>`` prefix every container for ``domain/task`` shares."""
+    slug = re.sub(r"[^a-z0-9]", "-", f"{domain}/{task}".lower()).strip("-")
+    return f"ale-{slug[:_CONTAINER_SLUG_MAX]}"
+
+
+def _docker(*args: str) -> tuple[int, str]:
+    """Run a docker CLI command; never raises, never blocks indefinitely."""
+    try:
+        p = subprocess.run(
+            ["docker", *args], capture_output=True, text=True,
+            timeout=_DOCKER_CLI_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.warning("docker %s failed: %s: %s", args[0], type(e).__name__, e)
+        return 1, ""
+    return p.returncode, (p.stdout or "").strip()
+
+
+def list_containers(prefix: str) -> set[str]:
+    """Names of the containers under ``prefix``, in any state."""
+    rc, out = _docker(
+        "ps", "-a", "--filter", f"name=^{prefix}-", "--format", "{{.Names}}",
+    )
+    if rc != 0:
+        return set()
+    return {ln.strip() for ln in out.splitlines() if ln.strip()}
+
+
+def reap_containers(
+    domain: str, task: str, output: str = "", before: set[str] | None = None,
+) -> list[str]:
+    """Force-remove sandbox containers a finished run left behind.
+
+    Cheap enough (one ``docker ps``) to call after every run, not just after a
+    timeout: a run that cleaned up properly matches nothing.
+
+    ``output`` is the run's combined stdout/stderr, which names each container
+    ale_run created and so identifies ours exactly. Only when that yields
+    nothing -- ale_run died before logging, or the pipes never drained -- do we
+    fall back to whatever appeared under this task's prefix since ``before`` was
+    sampled, which is ambiguous only if a second run of the same task started in
+    that window.
+    """
+    prefix = container_prefix(domain, task)
+    alive = list_containers(prefix)
+    if not alive:
+        return []
+    ours = {n for n in _CONTAINER_RE.findall(output or "") if n in alive}
+    if not ours:
+        ours = alive - (before or set())
+    removed = []
+    for name in sorted(ours):
+        rc, _ = _docker("rm", "-f", name)
+        if rc == 0:
+            removed.append(name)
+        else:
+            logger.warning("could not remove leaked ALE container %s", name)
+    if removed:
+        logger.warning(
+            "reaped %d leaked ALE container(s) for %s/%s: %s",
+            len(removed), domain, task, ", ".join(removed),
+        )
+    return removed
 
 
 @dataclass
@@ -138,6 +349,57 @@ def split_task_path(row: Any) -> tuple[str, str, str]:
     if len(parts) < 2:
         raise AleUnavailable(f"cannot parse domain/task from {rel!r}")
     return parts[0], parts[1], resolve_variant(parts[0], parts[1])
+
+
+@lru_cache(maxsize=256)
+def _public_task_card(source_repo_path: str) -> tuple[tuple[str, ...], str]:
+    """Read only the public guidance fields from one ALE task card.
+
+    ``source_repo_path`` originates in the dataset, but it is still resolved
+    and checked beneath ``ALE_ROOT/tasks`` before reading. Reference files,
+    hidden values, and every other task-card field stay out of the response.
+    """
+    tasks_root = (ALE_ROOT / "tasks").resolve()
+    rel = re.sub(r"^tasks/", "", source_repo_path.strip()).strip("/")
+    if not rel:
+        return (), ""
+    card = (tasks_root / rel / "task_card.json").resolve()
+    if tasks_root not in card.parents or not card.is_file():
+        return (), ""
+    try:
+        data = json.loads(card.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return (), ""
+    if not isinstance(data, Mapping):
+        return (), ""
+    raw_steps = data.get("agentMustDo") or data.get("agent_must_do") or []
+    steps = tuple(str(value) for value in raw_steps if isinstance(value, str)) \
+        if isinstance(raw_steps, (list, tuple)) else ()
+    evaluation = data.get("evaluation")
+    return steps, str(evaluation) if isinstance(evaluation, str) else ""
+
+
+def public_task_metadata(row: Any) -> dict[str, Any]:
+    """Return ALE's public required steps and natural-language evaluation.
+
+    The dataset's ``agent_must_do`` is preferred because it is the versioned
+    row used for this evaluation. ``task_card.json`` supplies the evaluation
+    text (and is a fallback for steps in older rows).
+    """
+    raw = row.raw if isinstance(getattr(row, "raw", None), Mapping) else {}
+    source = str(raw.get("source_repo_path") or getattr(row, "task_id", "") or "")
+    card_steps, card_evaluation = _public_task_card(source)
+    raw_steps = raw.get("agent_must_do") or raw.get("agentMustDo") or []
+    required_steps = (
+        [str(value) for value in raw_steps if isinstance(value, str)]
+        if isinstance(raw_steps, (list, tuple))
+        else []
+    )
+    evaluation = raw.get("evaluation")
+    return {
+        "required_steps": required_steps or list(card_steps),
+        "evaluation": str(evaluation) if isinstance(evaluation, str) else card_evaluation,
+    }
 
 
 def task_data_base(domain: str, task: str, variant: str) -> Path:
@@ -333,4 +595,8 @@ def grade(task: AleTask, split: str = "train") -> dict[str, Any]:
     ``raw_scores``, ``output_file``; on failure ``reason`` and possibly
     ``needs_sandbox``.
     """
-    return _run_driver(task, mode="grade", split=split)
+    result = _run_driver(task, mode="grade", split=split)
+    if result.get("ok"):
+        from .ale_verifier_capture import record_payload
+        record_payload(result)
+    return result

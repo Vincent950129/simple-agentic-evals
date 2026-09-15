@@ -15,7 +15,7 @@ and lists the available tools to prove the action surface is live. It does not
 solve the task, so grades will be ~0.0; that's expected. Swap in your real
 agent at the marked spot.
 
-Run (against a reachable evaluation service):
+Run (after `bash server/run.sh` is up):
 
     python examples/byoa_agent.py \
         --base-url http://localhost:8077 \
@@ -33,8 +33,8 @@ from pathlib import Path
 import httpx
 
 # Make the SDK importable without installing it.
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT))
+SDK_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(SDK_DIR))
 
 from simple_agentic_evals import EvalClient, McpServer  # noqa: E402
 

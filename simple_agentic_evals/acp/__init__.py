@@ -26,7 +26,7 @@ Public API:
     >>> await client.connect()
     >>> await client.initialize()
     >>> session = await client.session_new(cwd="/path/to/trial")
-    >>> await client.set_model("gpt-5-codex")
+    >>> await client.set_model("gpt-5")
     >>> result = await client.prompt("Do X.")
     >>> result.stop_reason
     <StopReason.END_TURN>

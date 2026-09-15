@@ -1,0 +1,239 @@
+[
+  {
+    "name": "filesystem.search_files",
+    "owner": "filesystem",
+    "description": "Search the task filesystem for relevant files and folders.",
+    "source_path": "mcp_servers/filesystem/mcp_servers/filesystem_server/tools/search_files.py",
+    "patterns": ["\\b(?:find|locate|search for)\\b.{0,60}\\b(?:file|folder|attachment|document|spreadsheet|presentation)\\b"]
+  },
+  {
+    "name": "filesystem.read_text_file",
+    "owner": "filesystem",
+    "description": "Read a text, HTML, or email file from the task filesystem.",
+    "source_path": "mcp_servers/filesystem/mcp_servers/filesystem_server/tools/read_text_file.py",
+    "input_extensions": [".txt", ".md", ".html", ".htm", ".eml"]
+  },
+  {
+    "name": "filesystem.read_image_file",
+    "owner": "filesystem",
+    "description": "Read an image file from the task filesystem.",
+    "source_path": "mcp_servers/filesystem/mcp_servers/filesystem_server/tools/read_image_file.py",
+    "input_extensions": [".png", ".jpg", ".jpeg", ".gif", ".webp"]
+  },
+  {
+    "name": "pdfs.search_pdf",
+    "owner": "pdfs",
+    "description": "Search within PDF documents for relevant passages.",
+    "source_path": "mcp_servers/pdfs/mcp_servers/pdf_server/tools/search_pdf.py",
+    "input_extensions": [".pdf"],
+    "patterns": ["\\b(?:search|find|locate)\\b.{0,60}\\b(?:pdf|filing|agreement|report|document)\\b"]
+  },
+  {
+    "name": "pdfs.read_pdf_pages",
+    "owner": "pdfs",
+    "description": "Read selected pages from PDF documents.",
+    "source_path": "mcp_servers/pdfs/mcp_servers/pdf_server/tools/read_pdf_pages.py",
+    "input_extensions": [".pdf"],
+    "patterns": ["\\b(?:review|analy[sz]e|read|use|refer to|based on)\\b.{0,80}\\b(?:pdf|filing|agreement|report)\\b"]
+  },
+  {
+    "name": "documents.read_document_content",
+    "owner": "documents",
+    "description": "Read the structured contents of a Word document.",
+    "source_path": "mcp_servers/documents/mcp_servers/docs_server/tools/read_document_content.py",
+    "input_extensions": [".doc", ".docx", ".rtf"],
+    "patterns": ["\\b(?:review|analy[sz]e|read|use|refer to|based on)\\b.{0,80}\\b(?:word document|docx|memorandum|memo|agreement|contract|letter)\\b"]
+  },
+  {
+    "name": "documents.create_document",
+    "owner": "documents",
+    "description": "Create a new Word document.",
+    "source_path": "mcp_servers/documents/mcp_servers/docs_server/tools/create_document.py",
+    "expected_outputs": ["make_new_doc"]
+  },
+  {
+    "name": "documents.edit_content_text",
+    "owner": "documents",
+    "description": "Edit text in an existing Word document.",
+    "source_path": "mcp_servers/documents/mcp_servers/docs_server/tools/edit_content_text.py",
+    "expected_outputs": ["make_new_doc", "edit_existing_doc"]
+  },
+  {
+    "name": "documents.apply_formatting",
+    "owner": "documents",
+    "description": "Apply professional formatting to a Word document.",
+    "source_path": "mcp_servers/documents/mcp_servers/docs_server/tools/apply_formatting.py",
+    "expected_outputs": ["make_new_doc", "edit_existing_doc"],
+    "patterns": ["\\b(?:format|formatting|style|heading|font|margin)\\b.{0,50}\\b(?:document|memo|letter|agreement)\\b"]
+  },
+  {
+    "name": "spreadsheets.read_tab",
+    "owner": "spreadsheets",
+    "description": "Read data and formulas from a spreadsheet tab.",
+    "source_path": "mcp_servers/spreadsheets/mcp_servers/sheets_server/tools/read_tab.py",
+    "input_extensions": [".xls", ".xlsx", ".xlsm", ".csv"],
+    "patterns": ["\\b(?:review|analy[sz]e|read|use|update|complete)\\b.{0,80}\\b(?:excel|spreadsheet|workbook|worksheet|model)\\b"]
+  },
+  {
+    "name": "spreadsheets.create_spreadsheet",
+    "owner": "spreadsheets",
+    "description": "Create a new spreadsheet workbook.",
+    "source_path": "mcp_servers/spreadsheets/mcp_servers/sheets_server/tools/create_spreadsheet.py",
+    "expected_outputs": ["make_new_sheet"]
+  },
+  {
+    "name": "spreadsheets.edit_spreadsheet",
+    "owner": "spreadsheets",
+    "description": "Write values, formulas, and formatting to a spreadsheet.",
+    "source_path": "mcp_servers/spreadsheets/mcp_servers/sheets_server/tools/edit_spreadsheet.py",
+    "expected_outputs": ["make_new_sheet", "edit_existing_sheet"]
+  },
+  {
+    "name": "spreadsheets.create_chart",
+    "owner": "spreadsheets",
+    "description": "Create a chart from spreadsheet data.",
+    "source_path": "mcp_servers/spreadsheets/mcp_servers/sheets_server/tools/create_chart.py",
+    "patterns": ["\\b(?:chart|graph|visuali[sz]ation)\\b.{0,70}\\b(?:excel|spreadsheet|workbook|worksheet|sheet)\\b", "\\b(?:excel|spreadsheet|workbook|worksheet|sheet)\\b.{0,70}\\b(?:chart|graph|visuali[sz]ation)\\b"]
+  },
+  {
+    "name": "presentations.read_slides",
+    "owner": "presentations",
+    "description": "Read slides from an existing presentation.",
+    "source_path": "mcp_servers/presentations/mcp_servers/slides_server/tools/read_slides.py",
+    "input_extensions": [".ppt", ".pptx"],
+    "patterns": ["\\b(?:review|read|use|update|edit)\\b.{0,70}\\b(?:powerpoint|presentation|slide deck|slides)\\b"]
+  },
+  {
+    "name": "presentations.create_slides",
+    "owner": "presentations",
+    "description": "Create a new presentation deck.",
+    "source_path": "mcp_servers/presentations/mcp_servers/slides_server/tools/create_slides.py",
+    "expected_outputs": ["make_new_slide_deck"]
+  },
+  {
+    "name": "presentations.edit_slides",
+    "owner": "presentations",
+    "description": "Edit slide text, layout, and content.",
+    "source_path": "mcp_servers/presentations/mcp_servers/slides_server/tools/edit_slides.py",
+    "expected_outputs": ["make_new_slide_deck", "edit_existing_slide_deck"]
+  },
+  {
+    "name": "presentations.insert_chart",
+    "owner": "presentations",
+    "description": "Insert a chart into a presentation.",
+    "source_path": "mcp_servers/presentations/mcp_servers/slides_server/tools/insert_chart.py",
+    "patterns": ["\\b(?:chart|graph|visuali[sz]ation)\\b.{0,70}\\b(?:powerpoint|presentation|deck|slide)\\b", "\\b(?:powerpoint|presentation|deck|slide)\\b.{0,70}\\b(?:chart|graph|visuali[sz]ation)\\b"]
+  },
+  {
+    "name": "mail.search_mail",
+    "owner": "mail",
+    "description": "Search the mailbox for relevant messages.",
+    "source_path": "mcp_servers/mail/mcp_servers/mail_server/tools/search_mail.py",
+    "patterns": ["\\b(?:email|e-mail|mailbox|inbox|mail)\\b"]
+  },
+  {
+    "name": "mail.read_mail",
+    "owner": "mail",
+    "description": "Read an email message and its metadata.",
+    "source_path": "mcp_servers/mail/mcp_servers/mail_server/tools/read_mail.py",
+    "patterns": ["\\b(?:email|e-mail|mailbox|inbox|mail)\\b"]
+  },
+  {
+    "name": "mail.send_mail",
+    "owner": "mail",
+    "description": "Send a new email message.",
+    "source_path": "mcp_servers/mail/mcp_servers/mail_server/tools/send_mail.py",
+    "patterns": ["\\b(?:send|write|draft) (?:an? )?(?:email|e-mail)\\b", "\\bemail (?:the|a|our|your|my|this)\\b"]
+  },
+  {
+    "name": "mail.reply_mail",
+    "owner": "mail",
+    "description": "Reply to an existing email thread.",
+    "source_path": "mcp_servers/mail/mcp_servers/mail_server/tools/reply_mail.py",
+    "patterns": ["\\breply(?: all)? to (?:the|this|an?) (?:email|e-mail|mail)\\b", "\\brespond to (?:the|this|an?) (?:email|e-mail)\\b"]
+  },
+  {
+    "name": "chat.get_channel_history",
+    "owner": "chat",
+    "description": "Read recent messages in a team-chat channel.",
+    "source_path": "mcp_servers/chat/mcp_servers/chat_server/tools/get_channel_history.py",
+    "patterns": ["\\b(?:chat channel|team channel|channel history|chat thread|slack)\\b"]
+  },
+  {
+    "name": "chat.get_thread_replies",
+    "owner": "chat",
+    "description": "Read replies in a team-chat thread.",
+    "source_path": "mcp_servers/chat/mcp_servers/chat_server/tools/get_thread_replies.py",
+    "patterns": ["\\b(?:chat thread|thread replies|replies in (?:the|a) thread)\\b"]
+  },
+  {
+    "name": "chat.post_message",
+    "owner": "chat",
+    "description": "Post a message to a team-chat channel.",
+    "source_path": "mcp_servers/chat/mcp_servers/chat_server/tools/post_message.py",
+    "patterns": ["\\b(?:post|send|write)\\b.{0,50}\\b(?:chat channel|team channel|slack channel)\\b"]
+  },
+  {
+    "name": "chat.reply_to_thread",
+    "owner": "chat",
+    "description": "Reply within a team-chat thread.",
+    "source_path": "mcp_servers/chat/mcp_servers/chat_server/tools/reply_to_thread.py",
+    "patterns": ["\\breply\\b.{0,40}\\b(?:chat thread|slack thread|channel thread)\\b"]
+  },
+  {
+    "name": "calendar.list_events",
+    "owner": "calendar",
+    "description": "List calendar events to inspect availability and schedules.",
+    "source_path": "mcp_servers/calendar/mcp_servers/calendar_server/tools/list_events.py",
+    "patterns": ["\\b(?:calendar|meeting schedule|availability|appointments?)\\b"]
+  },
+  {
+    "name": "calendar.create_event",
+    "owner": "calendar",
+    "description": "Create a calendar event and invite attendees.",
+    "source_path": "mcp_servers/calendar/mcp_servers/calendar_server/tools/create_event.py",
+    "patterns": ["\\b(?:schedule|book|set up|create)\\b.{0,50}\\b(?:meeting|calendar event|appointment|invite)\\b"]
+  },
+  {
+    "name": "calendar.update_event",
+    "owner": "calendar",
+    "description": "Update or reschedule an existing calendar event.",
+    "source_path": "mcp_servers/calendar/mcp_servers/calendar_server/tools/update_event.py",
+    "patterns": ["\\b(?:update|reschedule|move|change)\\b.{0,50}\\b(?:meeting|calendar event|appointment|invite)\\b"]
+  },
+  {
+    "name": "code.code_exec",
+    "owner": "code",
+    "description": "Execute code for calculations, transformations, and validation.",
+    "source_path": "mcp_servers/code/mcp_servers/code_execution_server/tools/code_exec.py",
+    "patterns": ["\\b(?:calculate|compute|model|forecast|regression|sensitivity analysis|valuation|reconcile|aggregate|average|percentage|growth rate|irr|npv|ebitda)\\b"]
+  },
+  {
+    "name": "edgar_sec.filings",
+    "owner": "edgar_sec",
+    "description": "Search and retrieve SEC EDGAR filings.",
+    "source_path": "mcp_servers/edgar_sec/mcp_servers/edgar_sec/tools/filings.py",
+    "patterns": ["\\b(?:edgar|sec filing|10-k|10-q|8-k|proxy statement|form 10|form 8-k)\\b"]
+  },
+  {
+    "name": "fmp.company_search",
+    "owner": "fmp",
+    "description": "Resolve public companies and securities for financial-data queries.",
+    "source_path": "mcp_servers/fmp/mcp_servers/fmp_server/tools/company_search.py",
+    "patterns": ["\\b(?:ticker|public company|listed company|stock symbol)\\b"]
+  },
+  {
+    "name": "fmp.quote",
+    "owner": "fmp",
+    "description": "Retrieve market quotes and share-price data.",
+    "source_path": "mcp_servers/fmp/mcp_servers/fmp_server/tools/quote.py",
+    "patterns": ["\\b(?:share price|stock price|market price|market capitalization|market cap|trading price)\\b"]
+  },
+  {
+    "name": "fmp.financial_statements",
+    "owner": "fmp",
+    "description": "Retrieve public-company financial statements and reported metrics.",
+    "source_path": "mcp_servers/fmp/mcp_servers/fmp_server/tools/financial_statements.py",
+    "patterns": ["\\b(?:financial statements?|income statement|balance sheet|cash flow statement|reported revenue|reported ebitda)\\b"]
+  }
+]

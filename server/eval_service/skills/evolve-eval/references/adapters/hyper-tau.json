@@ -1,0 +1,64 @@
+{
+  "format_version": 1,
+  "benchmark": "hyper-tau",
+  "adapter_id": "hyper-tau-6e9f34c6-v1",
+  "title": "Hyper-tau-bench",
+  "source_url": "https://github.com/sierra-research/hyper-tau-bench",
+  "source_commit": "6e9f34c685d40fa7a9f5935d8970af6fd9d5f118",
+  "dataset_roots": {
+    "evovling_tools": "../../../../../../data_dry_run/hyper_tau_bench_builder/hyper_tau_candidate/tools",
+    "evovling_skills": "../../../../../../data_dry_run/hyper_tau_bench_builder/hyper_tau_candidate/skills",
+    "evovling_agents": "../../../../../../data_dry_run/hyper_tau_bench_builder/hyper_tau_candidate/agents"
+  },
+  "entrypoint": "command_runtime.py:create_environment",
+  "entrypoint_sha256": "5296e9c99943a48163afb6a2b415b9189d03675681ab19053133188afe760f21",
+  "runnable": true,
+  "capabilities": {
+    "tracks": ["evovling_tools", "evovling_skills", "evovling_agents"],
+    "action_types": ["managed_runtime"],
+    "harnesses": ["codex", "official"],
+    "modes": ["deployment", "self_evolving", "task_specific"]
+  },
+  "credentials": ["OPENAI_API_KEY"],
+  "optional_credentials": {
+    "OPENROUTER_API_KEY": "Required only when HYPER_TAU_AGENT_MODEL routes through OpenRouter."
+  },
+  "smoke_task_ids": ["034_banking_knowledge_construction_client_api_deposit_opening"],
+  "runtime": {
+    "name": "Hyper-tau Developer harness and sealed evaluator",
+    "isolation": "official outer-task sandbox",
+    "network": "model endpoints declared by official harness",
+    "timeout_sec": 28800,
+    "resource_enforcement": true,
+    "enforced_tracks": [],
+    "runtime_artifact_sha256": {
+      "run_hyper_tau.py": "2e67dfbc9de9a866d0017e09d082256205861094cd4a5b04c26fe30b7506cf90"
+    },
+    "grader_authority": "Hyper-tau sealed evaluator",
+    "score_key": "final_test_reward",
+    "model_selection": {
+      "developer_harness_env": "HYPER_TAU_DEVELOPER_HARNESS",
+      "developer_harness_default": "codex",
+      "developer_model_env": "HYPER_TAU_DEVELOPER_LLM",
+      "developer_model_default": "gpt-5",
+      "constructed_agent_model_env": "HYPER_TAU_AGENT_MODEL",
+      "constructed_agent_model_default": "gpt-5.6-sol",
+      "provider_credentials_are_conditional": true
+    },
+    "run_command": [
+      "{manifest_dir}/../../../../../../data_dry_run/hyper_tau_bench_builder/cache/hyper-tau-venv/bin/python",
+      "{manifest_dir}/run_hyper_tau.py", "--task", "{task_id}"
+    ],
+    "required_paths": [
+      "{manifest_dir}/run_hyper_tau.py",
+      "{manifest_dir}/../../../../../../data_dry_run/hyper_tau_bench_builder/cache/hyper-tau-bench",
+      "{manifest_dir}/../../../../../../data_dry_run/hyper_tau_bench_builder/cache/hyper-tau-venv/bin/python"
+    ]
+  },
+  "deviations": [{
+    "track": "tools",
+    "approved": true,
+    "definition": "constructed-agent customer-service API operations are tools",
+    "limitation": "these are capabilities of the constructed agent rather than Developer-harness calls; the current sealed harness records but cannot constrain them, so runs are diagnostic"
+  }]
+}

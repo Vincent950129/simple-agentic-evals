@@ -1,0 +1,63 @@
+{
+  "format_version": 1,
+  "benchmark": "apex-agents",
+  "adapter_id": "apex-92c86856-archipelago-bcacc2d1-v1",
+  "title": "APEX-Agents",
+  "source_url": "https://huggingface.co/datasets/mercor/apex-agents",
+  "source_commit": "92c86856cf1b11f9833a8a076b3a45a63afa3929",
+  "dataset_roots": {
+    "evovling_tools": "../../../../../../data_dry_run/evovling_tools/apex_agents_validated",
+    "evovling_skills": "../../../../../../data_dry_run/evovling_skills/apex_agents_validated",
+    "evovling_agents": "../../../../../../data_dry_run/evovling_agents/apex_agents_validated"
+  },
+  "entrypoint": "command_runtime.py:create_environment",
+  "entrypoint_sha256": "5296e9c99943a48163afb6a2b415b9189d03675681ab19053133188afe760f21",
+  "runnable": true,
+  "capabilities": {
+    "tracks": ["evovling_tools", "evovling_skills", "evovling_agents"],
+    "action_types": ["managed_runtime", "mcp"],
+    "harnesses": ["codex", "official"],
+    "modes": ["deployment", "self_evolving", "task_specific"]
+  },
+  "credentials": ["HF_TOKEN", "OPENAI_API_KEY"],
+  "smoke_task_ids": ["task_b78c4510be784e6a8b8f0394aafd785d"],
+  "runtime": {
+    "name": "Archipelago @ bcacc2d1",
+    "isolation": "fresh Archipelago Docker world per session",
+    "network": "world and model endpoints declared by Archipelago",
+    "timeout_sec": 7200,
+    "resource_enforcement": true,
+    "enforced_tracks": ["evovling_tools"],
+    "enforcement_evidence": {
+      "path": "apex-tools-resource-enforcement.json",
+      "sha256": "22ae6a9d1aaab1c58c148b89ddd0791be37fc0cf4efc7d01a747f1aa2ef43794"
+    },
+    "runtime_artifact_sha256": {
+      "run_apex.py": "ff35ea6de6e592c4eaac4b732187cf6cb5c382ecbd34564db2c529a700a64bf9",
+      "verify_apex_enforcement.py": "52df482fd1d25f68a1f184261ceb8b2570e4ec4c28e9230210ecd5f0875feae4"
+    },
+    "grader_authority": "APEX official snapshot and rubric grader",
+    "model_selection": {
+      "agent_model_env": "EVAL_APEX_MODEL",
+      "agent_model_default": "openai/gpt-5",
+      "judge_model_env": "EVAL_APEX_JUDGE_MODEL",
+      "judge_model_default": "openai/gpt-5"
+    },
+    "score_key": "score",
+    "run_command": ["python", "{manifest_dir}/run_apex.py", "--task", "{task_id}"],
+    "required_paths": [
+      "{manifest_dir}/run_apex.py",
+      "{manifest_dir}/../../../../../../data_dry_run/apex_builder/cache/archipelago"
+    ]
+  },
+  "deviations": [{
+    "track": "tools",
+    "approved": true,
+    "definition": "exact Archipelago MCP operations are tools",
+    "enforcement": "Archipelago allowed_tool_names hides and rejects every operation outside the selected set"
+  }, {
+    "track": "skills/agents",
+    "approved": false,
+    "limitation": "the reviewed runtime currently enforces operation allowlists only; skill and owner-roster runs remain diagnostic"
+  }]
+}

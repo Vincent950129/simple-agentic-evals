@@ -153,14 +153,14 @@ def names_for(
 # On-disk bundle resolution (skills + agents)                                  #
 # --------------------------------------------------------------------------- #
 def _skills_oracle_root(benchmark: str, domain: str | None) -> Path:
-    base = loader.DATA_ROOT / "evovling_skills" / benchmark
+    base = loader.benchmark_root("evovling_skills", benchmark)
     if domain:
         base = base / domain
     return base / "_oracle" / "skills"
 
 
 def _agents_version_dir(benchmark: str, domain: str | None, version: int) -> Path:
-    base = loader.DATA_ROOT / "evovling_agents" / benchmark
+    base = loader.benchmark_root("evovling_agents", benchmark)
     if domain:
         base = base / domain
     return base / f"v{version}"
@@ -175,8 +175,25 @@ def _read_files(paths: list[Path], include_content: bool) -> list[dict[str, Any]
             size = p.stat().st_size
         except OSError:
             size = -1
+        # External local adapters normally keep their datasets outside the
+        # service's built-in DATA_ROOT.  Wire paths are descriptive only, so
+        # use a stable path relative to the closest registered dataset root
+        # and never leak an arbitrary absolute host path.
+        display = None
+        for root in (loader.DATA_ROOT, *(loader.adapter_registry.dataset_root(ds, bench)
+                      for ds in loader.KNOWN_DATASETS
+                      for bench in loader.adapter_registry.descriptors())):
+            if root is None:
+                continue
+            try:
+                display = p.relative_to(root)
+                break
+            except ValueError:
+                continue
+        if display is None:
+            display = Path(p.name)
         entry: dict[str, Any] = {
-            "path": str(p.relative_to(loader.DATA_ROOT)),
+            "path": display.as_posix(),
             "size": size,
         }
         if include_content:
@@ -204,7 +221,7 @@ def _skill_items(
     return items
 
 
-def _agent_manifest_index(agents_dir: Path) -> dict[str, dict[str, Any]]:
+def _agent_manifest_index(version_dir: Path, agents_dir: Path) -> dict[str, dict[str, Any]]:
     """Map agent name -> its ``manifest.json`` entry (tools/description/title).
 
     The published pool's ``agents/manifest.json`` carries the per-agent
@@ -212,7 +229,9 @@ def _agent_manifest_index(agents_dir: Path) -> dict[str, dict[str, Any]]:
     ``title`` — everything a caller needs to reconstruct a scoped specialist
     without the local capability library. Missing/unreadable -> empty index.
     """
-    mf = agents_dir / "manifest.json"
+    mf = version_dir / "manifest.json"
+    if not mf.is_file():
+        mf = agents_dir / "manifest.json"
     if not mf.is_file():
         return {}
     try:
@@ -235,7 +254,7 @@ def _agent_items(
         av = int(version)
     vdir = _agents_version_dir(benchmark, domain, av)
     agents_dir, skills_dir = vdir / "agents", vdir / "agent_skills"
-    manifest = _agent_manifest_index(agents_dir)
+    manifest = _agent_manifest_index(vdir, agents_dir)
     items = []
     for n in names:
         toml = agents_dir / f"{n}.toml"
@@ -250,7 +269,9 @@ def _agent_items(
             "files": _read_files(paths, include_content),
             # Reconstruction metadata (scoped tools + routing hint) so a remote
             # caller can rebuild the specialist without the capability library.
-            "tools": [str(t) for t in (entry.get("oracle_tools") or [])],
+            "tools": [str(t) for t in (
+                entry.get("oracle_tools") or entry.get("software") or entry.get("owned_software") or []
+            )],
             "description": str(entry.get("description") or ""),
             "title": str(entry.get("title") or ""),
         })

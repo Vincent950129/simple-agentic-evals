@@ -9,17 +9,16 @@ Bring-Your-Own-Agent (BYOA): the caller's agent acts on the environment through
 the action surface the service hands back (an MCP endpoint for EOG; a file
 sandbox for ALE), then asks the service to grade the resulting state.
 
-The heavy lifting is *reused* from the EnterpriseOps-Gym harness rather than
-reimplemented; the three modules the service needs are vendored under
-:mod:`eval_service._harness` so this checkout runs standalone:
+The heavy lifting is reused from the existing harness. Monorepo deployments
+import it directly; standalone clones fall back to the compatibility modules
+under :mod:`eval_service._harness`:
 
-  * ``_harness.dataset``      -- TaskRow + jsonl parsing
-  * ``_harness.endpoints``    -- reachable-endpoint discovery (patch_row)
-  * ``_harness.eog_verifier`` -- seed / verify / teardown + headers
+  * ``dataset``      -- TaskRow + JSONL parsing
+  * ``endpoints``    -- reachable-endpoint discovery (patch_row)
+  * ``eog_verifier`` -- seed / verify / teardown + headers
 
 This package only adds the multi-tenant session/lease layer and the wire
-contract on top. The client for it is ``simple_agentic_evals``, at the root of
-this repo.
+contract on top.
 """
 
 __all__ = ["__version__"]

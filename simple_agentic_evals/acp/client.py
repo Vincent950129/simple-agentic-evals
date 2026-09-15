@@ -6,7 +6,7 @@ Lifecycle (mirrors the ACP spec):
     await client.connect()
     await client.initialize()
     session = await client.session_new(cwd="/path/to/trial", mcp_servers=[...])
-    await client.set_model("gpt-5-codex")
+    await client.set_model("gpt-5")
     result = await client.prompt("Do X")            # may return multiple times
     ...
     await client.close()

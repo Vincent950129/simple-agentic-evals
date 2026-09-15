@@ -1,11 +1,11 @@
 """simple_agentic_evals -- a lightweight client for agentic evaluations.
 
 Inspired by openai/simple-evals, but for *agentic* benchmarks: the **service**
-hosts the executable environment, the reference agent harnesses, and the grader;
-you just connect, pick a task, run a harness, and read the score. It currently
-covers two benchmarks -- **EoG** (EnterpriseOps-Gym) and **ALE** (Agents' Last
-Exam). Nothing runs on your machine except this thin (``httpx``-only) client. A
-typical loop is ~10 lines:
+hosts executable environments, reference agent harnesses, and graders; you
+connect, pick a task, run a harness, and read the score. EOG and ALE are trusted
+hosted adapters. Any reviewed verifier-backed benchmark can use the same API
+through a checksum-approved loopback adapter, including the bundled TB2,
+APEX-Agents, and Hyper-tau references. A typical loop is ~10 lines:
 
     from simple_agentic_evals import EvalClient, react_agent
 
@@ -17,8 +17,8 @@ typical loop is ~10 lines:
             grade = task.grade()
             print(task.task_id, grade.pass_rate, run.latency_s, run.total_tokens)
 
-Two provided harnesses run **on the service**, so you install no gym, no model
-client, and no ``codex`` binary:
+Two provided harnesses run **on the selected service** (hosted or loopback), so
+the benchmark adapter—not the caller—owns provisioning and grading:
 
 * ``react_agent`` -- EnterpriseOps-Gym's reference ReAct agent (EOG only).
 * ``acp_codex_agent`` -- Codex over ACP. For EOG it acts on the task's gym MCP
@@ -62,10 +62,15 @@ import warnings
 from typing import Any
 
 from .agents import AgentRun, react_agent
-from .client import EvalClient, EvalReport, GradeResult, McpServer, ServiceError, Task
+from .benchmark import BenchmarkReport, CohortResult, run_benchmark
+from .client import (EvalClient, EvalReport, GradeResult, McpServer, MissingAPIKey,
+                     ServiceError, Task)
+from .command_agent import CommandAgent, CommandAgentError
 from .codex import CodexRun, acp_codex_agent
+from .leaderboard import aggregate_leaderboard, run_leaderboard
 from .mcp import MCPSession
 from .metrics import ContinualMetrics, StageResult
+from .runtime_adapters import catalog_targets, inspect_adapter, resolve_target, serve_local
 from .tools import sanitize_tool_schema, to_openai_tools
 
 
@@ -89,9 +94,13 @@ def run_codex_agent(*args: Any, **kwargs: Any) -> CodexRun:
 
 
 __all__ = [
+    # One call for a paper-comparable number
+    "run_benchmark", "run_leaderboard", "aggregate_leaderboard",
+    "BenchmarkReport", "CohortResult",
+    "CommandAgent", "CommandAgentError",
     # Core client
     "EvalClient", "Task", "GradeResult", "EvalReport",
-    "McpServer", "MCPSession", "ServiceError",
+    "McpServer", "MCPSession", "MissingAPIKey", "ServiceError",
     # Provided harnesses (run on the service)
     "react_agent", "acp_codex_agent",
     "AgentRun", "CodexRun",
@@ -100,5 +109,6 @@ __all__ = [
     # MCP<->OpenAI bridge (bring your own agent) + continual-learning metrics
     "to_openai_tools", "sanitize_tool_schema",
     "ContinualMetrics", "StageResult",
+    "catalog_targets", "inspect_adapter", "resolve_target", "serve_local",
 ]
-__version__ = "0.10.0"
+__version__ = "0.18.2"

@@ -16,8 +16,10 @@ benchmark families; only the *action surface* differs:
                      an output artifact, which is graded by the task's own
                      ``evaluate()`` / ``score_outputs.py``.  (implemented)
 
-Both shapes share the same lifecycle, so a client written against EOG today
-needs no change when it starts driving ALE — only ``action.type`` differs.
+  * ``"terminal"`` -- a benchmark-owned isolated terminal/container.
+
+  * ``"managed_runtime"`` -- an official benchmark harness owns the complete
+                              act/evaluate loop and is invoked by ``run_agent``.
 """
 
 from __future__ import annotations
@@ -91,6 +93,33 @@ class SandboxAction:
     grading: str = "local_evaluate"
 
 
+@dataclass
+class TerminalAction:
+    """Isolated terminal supplied by a local runtime adapter."""
+
+    type: Literal["terminal"] = "terminal"
+    runtime: str = ""
+    session_name: str = ""
+    workdir: str = "/workspace"
+    transport: str = "managed"
+    timeout_sec: int = 1800
+    network: str = "disabled"
+    resource_enforced: bool = False
+
+
+@dataclass
+class ManagedRuntimeAction:
+    """Official harness invoked as a whole by the adapter's ``run_agent`` hook."""
+
+    type: Literal["managed_runtime"] = "managed_runtime"
+    runtime: str = ""
+    task_id: str = ""
+    timeout_sec: int = 1800
+    network: str = "declared-by-adapter"
+    resource_enforced: bool = False
+    credentials: list[str] = field(default_factory=list)
+
+
 # --------------------------------------------------------------------------- #
 # Task + session views                                                        #
 # --------------------------------------------------------------------------- #
@@ -136,6 +165,10 @@ class TaskView:
     task_id: str
     system_prompt: str
     user_prompt: str
+    # ALE's public task-card guidance. These are metadata only: they do not
+    # change the prompt sent to an agent or the task's official evaluator.
+    required_steps: list[str] = field(default_factory=list)
+    evaluation: str = ""
     # Advisory only — the gold tool set the task needs. The agent still sees the
     # full tool surface on the MCP server; this is a hint, not an allowlist.
     oracle_tools: list[str] = field(default_factory=list)
@@ -160,9 +193,12 @@ class SessionView:
 class VerifierView:
     name: str
     passed: bool
+    score: float | None = None
     expected: Any = None
     actual: Any = None
     comparison_type: str = ""
+    description: str = ""
+    details: Any = None
     error: str | None = None
 
 

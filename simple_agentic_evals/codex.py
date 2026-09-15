@@ -11,7 +11,7 @@ behavior matches the reference harness exactly:
     client = EvalClient()                        # endpoint + auth from the env
     task = client.task("evovling_skills", "eog", 1, task_id, domain="hr")
     with task:
-        run = acp_codex_agent(task, api_key="sk-...", model="gpt-5-codex")
+        run = acp_codex_agent(task, api_key="sk-...", model="gpt-5")
         print(task.grade().pass_rate, run.latency_s, run.total_tokens)
 
 Works for **EOG** (skills/agents/tools -- the run mutates the session DB;
@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import _render
+from .client import resolve_openai_key
 
 logger = logging.getLogger(__name__)
 
@@ -169,19 +170,22 @@ def acp_codex_agent(
     task.start()
     is_ale = (task.benchmark or "").lower() == "ale"
     if timeout_s is None:
-        timeout_s = _ALE_DEFAULT_TIMEOUT_S if is_ale else _EOG_DEFAULT_TIMEOUT_S
-    if not task.mcp_servers and not is_ale:
+        timeout_s = (
+            _ALE_DEFAULT_TIMEOUT_S if is_ale else
+            float(task.action.get("timeout_sec") or _EOG_DEFAULT_TIMEOUT_S)
+        )
+    managed = task.action_type in ("terminal", "managed_runtime")
+    if not task.mcp_servers and not is_ale and not managed:
         raise RuntimeError(
             f"task {task.task_id!r} exposes no MCP servers "
-            f"(action_type={task.action_type!r}); acp_codex_agent needs an EOG or "
-            f"ALE task.")
+            f"(action_type={task.action_type!r}); no compatible Codex runtime is advertised.")
     if task.session_id is None:
         raise RuntimeError("call task.start() (or use `with task:`) first")
 
     level = _render.normalize_verbose(verbose)
     body: dict[str, Any] = {
         "agent": "codex",
-        "openai_api_key": api_key,
+        "openai_api_key": resolve_openai_key(api_key),
         "model": model,
         "restrict_to_selected_tools": bool(allowed_tools),
         "max_episodes": int(max_episodes),

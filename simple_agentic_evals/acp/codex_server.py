@@ -332,6 +332,11 @@ class CodexAcpServer:
             cmd += ["resume", state.thread_id, "--json"]  # type: ignore[list-item]
         else:
             cmd += ["--json", "--cd", state.cwd]
+        # Trial dirs are throwaway temp dirs, never git repos. Without this the
+        # CLI exits 1 with "Not inside a trusted directory and
+        # --skip-git-repo-check was not specified", which surfaces as a bare
+        # stop_reason=refusal with no events.
+        cmd += ["--skip-git-repo-check"]
         if state.model_id:
             cmd += ["--model", state.model_id]
         cmd += ["--", prompt_text]

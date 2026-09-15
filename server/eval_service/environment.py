@@ -30,15 +30,26 @@ import logging
 import uuid
 from typing import Any
 
-from ._harness.dataset import TaskRow
-from ._harness.endpoints import patch_row
-from ._harness.eog_verifier import (
-    VerificationReport,
-    normalize_context,
-    run_verifiers,
-    seed_databases,
-    teardown_databases,
-)
+try:  # monorepo deployment
+    from evovle_skills.src.dataset import TaskRow
+    from evovle_skills.src.endpoints import patch_row
+    from evovle_skills.src.eog_verifier import (
+        VerificationReport,
+        normalize_context,
+        run_verifiers,
+        seed_databases,
+        teardown_databases,
+    )
+except ImportError:  # standalone GitHub checkout
+    from ._harness.dataset import TaskRow
+    from ._harness.endpoints import patch_row
+    from ._harness.eog_verifier import (
+        VerificationReport,
+        normalize_context,
+        run_verifiers,
+        seed_databases,
+        teardown_databases,
+    )
 
 from . import ale_docker_grader, ale_grader
 from .contract import (
@@ -247,21 +258,15 @@ class AleEnvironment:
 
         score = float(res.get("score", 0.0))
         passed = score >= ale_grader.SUCCESS_THRESHOLD
+        verifier_rows = ale_grader.verifier_records(res, grading_path=grading_path)
         return GradeResult(
             session_id="",
             task_id=row.task_id,
             overall_success=passed,
             pass_rate=score,
-            n_passed=1 if passed else 0,
-            n_total=1,
-            per_verifier=[VerifierView(
-                name="ale_score",
-                passed=passed,
-                expected=f">= {ale_grader.SUCCESS_THRESHOLD}",
-                actual=round(score, 6),
-                comparison_type=f"ale_score:{grading_path}",
-                error=None,
-            )],
+            n_passed=sum(bool(v["passed"]) for v in verifier_rows),
+            n_total=len(verifier_rows),
+            per_verifier=[VerifierView(**v) for v in verifier_rows],
         )
 
     def teardown(self, row: TaskRow, env_state: dict[str, Any]) -> None:
@@ -276,6 +281,11 @@ def get_environment(benchmark: str):
         return EogEnvironment()
     if benchmark == "ale":
         return AleEnvironment()
+    from . import adapter_registry
+
+    item = adapter_registry.descriptor(benchmark)
+    if item and item.runnable:
+        return adapter_registry.load_factory(item)(item)
     raise ValueError(f"no environment backend for benchmark {benchmark!r}")
 
 
@@ -296,6 +306,7 @@ def report_to_result(
             VerifierView(
                 name=v.name,
                 passed=v.passed,
+                score=1.0 if v.passed else 0.0,
                 expected=v.expected,
                 actual=v.actual,
                 comparison_type=v.comparison_type,

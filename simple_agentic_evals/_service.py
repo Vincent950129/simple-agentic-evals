@@ -12,4 +12,4 @@ passing ``base_url=``) without touching this file. The service can also override
 value at wheel-build time via ``$EVAL_SERVICE_PUBLIC_URL`` (see ``_build_sdk_wheel``).
 """
 
-DEFAULT_BASE_URL = "https://idealist-unwritten-astronaut.ngrok-free.dev"
+DEFAULT_BASE_URL = "https://educator-marrow-cultural.ngrok-free.dev"

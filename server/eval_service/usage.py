@@ -6,7 +6,7 @@ for, with zero client cooperation and zero external dependencies:
 
   * **popularity over time** -- request counts bucketed by hour/day, plus a
     breakdown by client (``User-Agent``; the SDK tags itself so you can tell
-    SDK traffic from curl/browser) and by dataset.
+    SDK traffic from curl/browser), authenticated user, and dataset.
   * **current bottleneck** -- per-endpoint server-side latency percentiles
     (p50/p95/p99/max), so the slowest routes (e.g. ``run_agent``, the MCP proxy)
     rise to the top.
@@ -48,6 +48,12 @@ _DAY_FMT = "%Y-%m-%d"
 # counts. Override/extend via ``$EVAL_SERVICE_USAGE_EXCLUDE`` (comma-separated
 # route paths). Matched on the request path (any method).
 _DEFAULT_EXCLUDE = frozenset({"/v1/usage", "/v1/usage/dashboard", "/dashboard"})
+UNKNOWN_USER = "unknown user"
+
+
+def _user_label(value: Any) -> str:
+    """Normalise the trusted proxy label without ever handling an API key."""
+    return (str(value or "").strip()[:200] or UNKNOWN_USER)
 
 
 def _now() -> float:
@@ -115,6 +121,7 @@ class UsageLog:
         self.errors: Counter[str] = Counter()         # endpoint -> n (status >= 400)
         self.status: Counter[str] = Counter()         # "200" -> n
         self.by_client: Counter[str] = Counter()      # User-Agent -> n
+        self.by_user: Counter[str] = Counter()        # authenticated identity -> n
         self.by_dataset: Counter[str] = Counter()     # dataset -> n
         self.by_hour: Counter[str] = Counter()        # "YYYY-MM-DDTHH" -> n
         self.by_day: Counter[str] = Counter()         # "YYYY-MM-DD" -> n
@@ -122,6 +129,9 @@ class UsageLog:
         self._sum: dict[str, float] = defaultdict(float)   # endpoint -> total ms (for mean)
         self._max: dict[str, float] = defaultdict(float)   # endpoint -> max ms
         self._n_all: Counter[str] = Counter()             # endpoint -> lifetime n (for mean)
+        self._user_errors: Counter[str] = Counter()
+        self._user_endpoints: dict[str, Counter[str]] = defaultdict(Counter)
+        self._user_datasets: dict[str, Counter[str]] = defaultdict(Counter)
         self.last_ts: float | None = None
 
     # -- ingest -------------------------------------------------------------- #
@@ -160,6 +170,7 @@ class UsageLog:
         status: int,
         duration_ms: float,
         client: str = "",
+        user: str = UNKNOWN_USER,
         dataset: str | None = None,
         ts: float | None = None,
     ) -> None:
@@ -173,6 +184,7 @@ class UsageLog:
             "status": int(status),
             "duration_ms": round(float(duration_ms), 2),
             "client": (client or "")[:200],
+            "user": _user_label(user),
         }
         if dataset:
             rec["dataset"] = str(dataset)
@@ -195,8 +207,12 @@ class UsageLog:
         self._n_all[ep] += 1
         st = int(rec.get("status", 0))
         self.status[str(st)] += 1
+        user = _user_label(rec.get("user"))
+        self.by_user[user] += 1
+        self._user_endpoints[user][ep] += 1
         if st >= 400:
             self.errors[ep] += 1
+            self._user_errors[user] += 1
         self.by_client[(rec.get("client") or "unknown")] += 1
         dt = float(rec.get("duration_ms", 0.0))
         self._samples[ep].append(dt)
@@ -210,6 +226,7 @@ class UsageLog:
         ds = rec.get("dataset")
         if ds:
             self.by_dataset[ds] += 1
+            self._user_datasets[user][str(ds)] += 1
         self.last_ts = ts
         if persist and self.path is not None:
             try:
@@ -248,7 +265,10 @@ class UsageLog:
         ``top_by_calls`` answers *how popular* (endpoints ranked by request
         count); ``top_by_latency_p95`` answers *what's the bottleneck* (same rows
         ranked by p95 server latency). ``by_hour``/``by_day`` are the over-time
-        series; ``by_client`` attributes traffic (SDK vs other).
+        series; ``by_client`` attributes traffic (SDK vs other), while
+        ``by_user`` and ``user_usage`` attribute it to the non-secret identity
+        resolved by the authentication proxy. Legacy/unattributable records are
+        grouped under ``unknown user``.
         """
         top = max(1, int(top))
         with self._lock:
@@ -259,6 +279,16 @@ class UsageLog:
             )[:top]
             hours = dict(sorted(self.by_hour.items())[-48:])
             days = dict(sorted(self.by_day.items())[-60:])
+            user_usage = [
+                {
+                    "user": user,
+                    "requests": count,
+                    "errors": self._user_errors[user],
+                    "by_endpoint": dict(self._user_endpoints[user].most_common(top)),
+                    "by_dataset": dict(self._user_datasets[user].most_common(top)),
+                }
+                for user, count in self.by_user.most_common()
+            ]
             return {
                 "enabled": self.enabled,
                 "since": datetime.fromtimestamp(self.started_at, timezone.utc).isoformat(),
@@ -274,6 +304,8 @@ class UsageLog:
                 "top_by_calls": by_calls,          # popularity
                 "top_by_latency_p95": by_latency,  # bottleneck
                 "by_client": dict(self.by_client.most_common(top)),
+                "by_user": dict(self.by_user.most_common()),
+                "user_usage": user_usage,
                 "by_dataset": dict(self.by_dataset.most_common(top)),
                 "by_hour": hours,
                 "by_day": days,
@@ -385,6 +417,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
   <div class="panel">
+    <h2>By authenticated user <span class="muted">(legacy/shared-key traffic is unknown)</span></h2>
+    <div id="users"></div>
+  </div>
+  <div class="panel">
     <h2>Endpoints by calls <span class="muted">&mdash; how popular</span></h2>
     <div id="bycalls"></div>
   </div>
@@ -478,6 +514,7 @@ async function load(){
     renderEndpointTable($("#bycalls"), u.top_by_calls||[]);
     renderEndpointTable($("#bylatency"), u.top_by_latency_p95||[]);
     renderBars($("#clients"), Object.entries(u.by_client||{}), "#f472b6");
+    renderBars($("#users"), Object.entries(u.by_user||{}), "#38bdf8");
     renderBars($("#datasets"), Object.entries(u.by_dataset||{}), "#34d399");
     $("#meta").textContent = (u.enabled ? "" : "[telemetry DISABLED] ")
       + (u.log_path ? ("log: "+u.log_path) : "in-memory only");

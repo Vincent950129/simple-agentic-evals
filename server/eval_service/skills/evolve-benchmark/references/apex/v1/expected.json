@@ -1,0 +1,24 @@
+{
+  "agents": {
+    "capabilities": 10,
+    "retained_tasks": 392,
+    "versions": 3
+  },
+  "archipelago_commit": "bcacc2d1e99aa917bbe7f6f663c1551dc6ec7400",
+  "content_hash": "8ef9f9aaf2ea5f53447cb90e5a5716a7a0063d9450c5c488e3ac4f13714e088c",
+  "discovered_tasks": 480,
+  "huggingface_hub": "0.26.2",
+  "seed": 42,
+  "skills": {
+    "capabilities": 19,
+    "retained_tasks": 470,
+    "versions": 6
+  },
+  "source_commit": "92c86856cf1b11f9833a8a076b3a45a63afa3929",
+  "tomli": "2.0.1",
+  "tools": {
+    "capabilities": 22,
+    "retained_tasks": 392,
+    "versions": 4
+  }
+}

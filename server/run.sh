@@ -12,26 +12,51 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${SCRIPT_DIR}"
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8077}"
+PY="${PYTHON:-python3}"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
+if ! "${PY}" -c 'import simple_agentic_evals' 2>/dev/null; then
+  echo "WARNING: ${PY} cannot import the checkout's simple_agentic_evals package." >&2
+  echo "         Install with 'pip install -e .' or set PYTHON to that environment." >&2
+fi
 
 # The reference EOG ReAct agent imports langchain, which the service's own
 # interpreter need not carry -- without this the agent dies with
 # "No module named 'langchain_core'". Point EVAL_SERVICE_REACT_PYTHON at an
 # interpreter that has it (the reference gym's venv is the usual choice).
+_react_ok() {
+  local candidate
+  candidate="$(command -v "$1" 2>/dev/null || true)"
+  [[ -n "${candidate}" && -x "${candidate}" ]] && "${candidate}" -c \
+    'from langchain_core.messages import HumanMessage; from langchain_openai import ChatOpenAI' \
+    2>/dev/null
+}
+
+if [[ -n "${EVAL_SERVICE_REACT_PYTHON:-}" ]] && ! _react_ok "${EVAL_SERVICE_REACT_PYTHON}"; then
+  echo "WARNING: EVAL_SERVICE_REACT_PYTHON=${EVAL_SERVICE_REACT_PYTHON} lacks ReAct dependencies; probing instead." >&2
+  unset EVAL_SERVICE_REACT_PYTHON
+fi
 if [[ -z "${EVAL_SERVICE_REACT_PYTHON:-}" ]]; then
-  for cand in "${EOG_ROOT:-${SCRIPT_DIR}/reference/EnterpriseOps-Gym}/.venv/bin/python"; do
-    if [[ -x "${cand}" ]] && "${cand}" -c 'import langchain_core' 2>/dev/null; then
+  for cand in "${EOG_ROOT:-${SCRIPT_DIR}/reference/EnterpriseOps-Gym}/.venv/bin/python" "${PY}"; do
+    if _react_ok "${cand}"; then
       export EVAL_SERVICE_REACT_PYTHON="${cand}"
       echo "EOG ReAct interpreter: ${cand}"
       break
     fi
   done
 fi
+if [[ -z "${EVAL_SERVICE_REACT_PYTHON:-}" ]]; then
+  echo "WARNING: no interpreter with langchain-core + langchain-openai found; EOG ReAct runs will fail." >&2
+fi
 
-CMD=(python3 -m uvicorn eval_service.service:app --host "${HOST}" --port "${PORT}")
+export EVOVLE_CODEX_MODEL="${EVOVLE_CODEX_MODEL:-gpt-5}"
+
+CMD=("${PY}" -m uvicorn eval_service.service:app --host "${HOST}" --port "${PORT}")
 if [[ "${RELOAD:-0}" == "1" ]]; then
   CMD+=(--reload --reload-dir eval_service)
 fi
@@ -51,5 +76,5 @@ else
   echo "         Install it (apt-get install tini) or set \$TINI_BIN." >&2
 fi
 
-echo "Starting Evaluation Service on http://${HOST}:${PORT}  (cwd=${SCRIPT_DIR})"
+echo "Starting Evaluation Service on http://${HOST}:${PORT}  (cwd=${SCRIPT_DIR}, python=$(command -v "${PY}"))"
 exec "${CMD[@]}"

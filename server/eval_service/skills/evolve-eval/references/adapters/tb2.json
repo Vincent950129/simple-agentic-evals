@@ -1,0 +1,52 @@
+{
+  "format_version": 1,
+  "benchmark": "terminal-bench-2",
+  "adapter_id": "tb2-harbor-2fd12b88-v1",
+  "title": "Terminal-Bench 2",
+  "source_url": "https://github.com/harbor-framework/terminal-bench-2",
+  "source_commit": "2fd12b88aafdd04a52c298e3940bcb189f9766d6",
+  "dataset_roots": {
+    "evovling_tools": "../../../../../../data_dry_run/evovling_tools/terminal_bench_2_validated",
+    "evovling_skills": "../../../../../../data_dry_run/evovling_skills/terminal_bench_2_validated",
+    "evovling_agents": "../../../../../../data_dry_run/evovling_agents/terminal_bench_2_validated"
+  },
+  "entrypoint": "command_runtime.py:create_environment",
+  "entrypoint_sha256": "5296e9c99943a48163afb6a2b415b9189d03675681ab19053133188afe760f21",
+  "runnable": true,
+  "capabilities": {
+    "tracks": ["evovling_tools", "evovling_skills", "evovling_agents"],
+    "action_types": ["terminal", "managed_runtime"],
+    "harnesses": ["codex", "official", "oracle"],
+    "modes": ["deployment", "self_evolving", "task_specific"]
+  },
+  "credentials": ["OPENAI_API_KEY"],
+  "smoke_task_ids": ["cancel-async-tasks"],
+  "runtime": {
+    "name": "Harbor 0.23.0 @ d8cfe6b6",
+    "isolation": "Harbor Docker task container per session",
+    "network": "Harbor task policy",
+    "timeout_sec": 2700,
+    "resource_enforcement": true,
+    "enforced_tracks": [],
+    "runtime_artifact_sha256": {
+      "run_tb2.py": "8e36365b7c1ed509adf5a17a7b9845863d56432e03511209908a494907bd94e7",
+      "tb2_remote_docker.py": "1d5fece3c8d735be4529adea4380998c2736272e083749d86b36df401b372a94"
+    },
+    "grader_authority": "Terminal-Bench task verifier",
+    "score_key": "reward",
+    "run_command": ["python", "{manifest_dir}/run_tb2.py", "--task", "{task_id}"],
+    "required_paths": [
+      "{manifest_dir}/run_tb2.py",
+      "{manifest_dir}/tb2_remote_docker.py",
+      "{manifest_dir}/../../../../../../data_dry_run/tb_builder/cache/terminal-bench-2",
+      "{manifest_dir}/../../../../../../data_dry_run/tb_builder/cache/harbor",
+      "{manifest_dir}/../../../../../../data_dry_run/tb_builder/cache/venv/bin/harbor"
+    ]
+  },
+  "deviations": [{
+    "track": "tools",
+    "approved": true,
+    "definition": "task-facing software is the evolving tool capability",
+    "visibility": "The official task image fixes its software; cumulative cross-task software cannot be removed safely, so current TB2 runs are diagnostic rather than leaderboard-comparable"
+  }]
+}

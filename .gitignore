@@ -19,5 +19,11 @@ venv/
 # Server runtime state (per-session ALE workspaces, telemetry, tunnel analytics).
 server/eval_service/.ale_workspaces/
 server/eval_service/logs/
-server/.tunnel_analytics/
+server/eval_service/.tunnel_analytics/
+server/eval_service/auth/
+server/eval_service/runs/
 server/bin/
+
+# Local evaluation outputs and command-agent workspaces.
+eval-run/
+full-run/

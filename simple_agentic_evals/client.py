@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterator
 
 import httpx
@@ -29,6 +31,41 @@ def _user_agent() -> str:
     return f"simple_agentic_evals/{version}"
 
 
+class MissingAPIKey(ValueError):
+    """No OpenAI key for a harness the service runs for you.
+
+    Its own type because it is a setup mistake, not a task the agent failed:
+    ``run_benchmark`` scores a failed task 0.0 and keeps going, which would turn
+    a forgotten key into a clean-looking ACC of 0.0 across the whole sweep.
+    """
+
+
+def resolve_openai_key(api_key: str | None) -> str:
+    """Your OpenAI key for a harness the service runs on your behalf.
+
+    Two different keys are in play. The eval service key (MyAuthtoken) gets you
+    into the service; this one pays for the model. The service hosts the
+    environment, the harness and the grader but never lends its own credentials,
+    so an explicit ``api_key`` wins and ``$OPENAI_API_KEY`` is the fallback.
+    Raising here rather than letting the service answer 400 keeps the message
+    next to the call that is missing the key.
+
+    Bring-your-own-agent needs none of this: you call your model yourself and
+    use the service only for the environment and grading.
+    """
+    key = (api_key or os.environ.get("OPENAI_API_KEY") or "").strip()
+    if not key:
+        raise MissingAPIKey(
+            "no OpenAI API key: pass api_key=... or set $OPENAI_API_KEY. The "
+            "service runs this harness for you but does not pay for the "
+            "inference, so it will not fall back to its own key. Get one at "
+            "https://platform.openai.com/api-keys (this is NOT your eval "
+            "service key from MyAuthtoken -- that one authenticates you to the "
+            "service and is already working if you got this far)."
+        )
+    return key
+
+
 class ServiceError(RuntimeError):
     """A non-2xx response from the evaluation service.
 
@@ -37,10 +74,14 @@ class ServiceError(RuntimeError):
     (HTTP 501: the task's grader must run in a full sandbox not available here).
     """
 
-    def __init__(self, status_code: int, detail: str = "", *, url: str = ""):
+    def __init__(self, status_code: int, detail: str = "", *, url: str = "",
+                 body: dict | None = None):
         self.status_code = int(status_code)
         self.detail = detail or ""
         self.url = url
+        self.body = body or {}
+        #: Where to get a key, when the service says the request was unauthorized.
+        self.signup_url = str(self.body.get("signup_url") or "")
         loc = f" from {url}" if url else ""
         super().__init__(f"HTTP {self.status_code}{loc}: {self.detail}".rstrip(": "))
 
@@ -48,18 +89,35 @@ class ServiceError(RuntimeError):
     def needs_sandbox(self) -> bool:
         return self.status_code == 501
 
+    @property
+    def needs_api_key(self) -> bool:
+        """True when this failed for lack of a valid key rather than anything else.
+
+        Lets a caller react to a credential problem specifically -- prompt for a
+        key and retry -- instead of pattern-matching the message.
+        """
+        return self.status_code in (401, 403)
+
 
 def _raise_for_status(r: httpx.Response) -> None:
     """Raise :class:`ServiceError` on a non-2xx response (keeps httpx internal)."""
     if r.is_success:
         return
-    detail = ""
+    detail, body = "", None
     try:
-        body = r.json()
-        detail = body.get("detail", "") if isinstance(body, dict) else str(body)
+        parsed = r.json()
+        if isinstance(parsed, dict):
+            body, detail = parsed, parsed.get("detail", "")
+        else:
+            detail = str(parsed)
     except Exception:  # noqa: BLE001 - fall back to raw text
         detail = (r.text or "")[:500]
-    raise ServiceError(r.status_code, detail, url=str(r.request.url))
+    if not detail and r.status_code in (401, 403):
+        # A gate that rejects without saying why (or a proxy that swallowed the
+        # body) would otherwise surface as a bare "HTTP 401".
+        detail = ("missing or invalid API key for the evaluation service; set "
+                  "$EVAL_SERVICE_API_KEY or pass EvalClient(api_key=...)")
+    raise ServiceError(r.status_code, detail, url=str(r.request.url), body=body)
 
 
 @dataclass
@@ -152,6 +210,8 @@ class Task:
         self.session_id: str | None = None
         self.system_prompt: str = ""
         self.user_prompt: str = ""
+        self.required_steps: list[str] = []
+        self.evaluation: str = ""
         self.oracle_tools: list[str] = []
         # Evolving tools/skills/agents attached when tasks(resource_mode=...) is set:
         # {"kind","mode","count","names",[...]}. Empty unless a mode was requested.
@@ -169,6 +229,8 @@ class Task:
         task = sv.get("task", {})
         self.system_prompt = task.get("system_prompt", "")
         self.user_prompt = task.get("user_prompt", "")
+        self.required_steps = list(task.get("required_steps") or [])
+        self.evaluation = str(task.get("evaluation") or "")
         self.oracle_tools = list(task.get("oracle_tools") or [])
         self.resources = dict(task.get("resources") or {})
         self.action = sv.get("action", {})
@@ -226,6 +288,16 @@ class Task:
     def sandbox(self) -> dict[str, Any]:
         """Sandbox action payload (ALE). Empty dict for non-sandbox actions."""
         return self.action if self.action_type == "sandbox" else {}
+
+    @property
+    def terminal(self) -> dict[str, Any]:
+        """Terminal action payload from a local runtime adapter."""
+        return self.action if self.action_type == "terminal" else {}
+
+    @property
+    def managed_runtime(self) -> dict[str, Any]:
+        """Official managed-runtime action payload from a local adapter."""
+        return self.action if self.action_type == "managed_runtime" else {}
 
     @property
     def input_files(self) -> list[dict[str, Any]]:
@@ -289,6 +361,60 @@ class Task:
     def submit_text(self, path: str, text: str) -> list[str]:
         """Convenience: submit a single text artifact at ``path`` (ALE)."""
         return self.submit([{"path": path, "content": text}])
+
+    # -- directory in / directory out --------------------------------------- #
+    # An existing system -- a CLI, a container, a repo you already run -- is
+    # usually "read a directory, write a directory". These two turn that shape
+    # into an ALE agent without any per-file glue: stage in, run it however you
+    # like, ship whatever it wrote back.
+    def fetch_inputs_to(self, dest: str | Path) -> Path:
+        """Download every staged input into ``dest``, keeping relative paths (ALE).
+
+        Returns ``dest`` so it can be handed straight to a subprocess or bind-mounted
+        into a container. Creates the directory (and parents) if missing.
+        """
+        root = Path(dest)
+        root.mkdir(parents=True, exist_ok=True)
+        for f in self.inputs():
+            rel = str(f.get("path") or "").lstrip("/")
+            if not rel:
+                continue
+            out = (root / rel).resolve()
+            if root.resolve() not in out.parents:   # a "../" path would escape dest
+                raise ValueError(f"input path escapes {root}: {rel!r}")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(self.fetch_input(rel))
+        return root
+
+    def submit_dir(self, src: str | Path, *, max_bytes: int = 32 * 1024 * 1024) -> list[str]:
+        """Submit every file under ``src`` (ALE); returns the written relpaths.
+
+        Paths are submitted relative to ``src``, so pointing it at the directory your
+        system treated as the sandbox root reproduces the layout the task asked for.
+        Text is sent as text and anything that is not valid UTF-8 as base64, so
+        binaries survive. ``max_bytes`` guards against posting a whole build tree by
+        accident -- raise it deliberately if a task really needs to.
+        """
+        root = Path(src)
+        if not root.is_dir():
+            raise NotADirectoryError(f"{root} is not a directory")
+        files, total = [], 0
+        for p in sorted(root.rglob("*")):
+            if not p.is_file() or p.is_symlink():
+                continue
+            raw = p.read_bytes()
+            total += len(raw)
+            if total > max_bytes:
+                raise ValueError(
+                    f"submission exceeds {max_bytes} bytes at {p.relative_to(root)}; "
+                    f"submit only the deliverable, or raise max_bytes")
+            rel = p.relative_to(root).as_posix()
+            try:
+                files.append({"path": rel, "content": raw.decode("utf-8")})
+            except UnicodeDecodeError:
+                files.append({"path": rel,
+                              "content_b64": base64.b64encode(raw).decode("ascii")})
+        return self.submit(files) if files else []
 
     # -- grading ------------------------------------------------------------ #
     def grade(self, keep_alive: bool = False) -> GradeResult:

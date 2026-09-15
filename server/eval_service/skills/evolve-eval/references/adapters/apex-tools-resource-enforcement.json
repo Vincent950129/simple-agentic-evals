@@ -1,0 +1,47 @@
+{
+  "adapter_id": "apex-92c86856-archipelago-bcacc2d1-v1",
+  "format_version": 1,
+  "source_commit": "92c86856cf1b11f9833a8a076b3a45a63afa3929",
+  "tracks": {
+    "evovling_tools": {
+      "controls": [
+        {
+          "evidence": "verify_apex_enforcement.py executed the selected operation through the pinned gateway middleware",
+          "id": "allowed_resource_available",
+          "passed": true
+        },
+        {
+          "evidence": "verify_apex_enforcement.py proved an unselected operation is absent from list_tools",
+          "id": "forbidden_resource_inaccessible",
+          "passed": true
+        },
+        {
+          "evidence": "verify_apex_enforcement.py verified the official agent port installs the one reviewed gateway config",
+          "id": "ambient_bypass_blocked",
+          "passed": true
+        },
+        {
+          "evidence": "verify_apex_enforcement.py derived the allowlist from only this task's oracle_tools",
+          "id": "task_specific_oracle_only",
+          "passed": true
+        },
+        {
+          "evidence": "verify_apex_enforcement.py proved v2 cumulative tools exclude capabilities introduced by v4",
+          "id": "self_evolving_stage_isolation",
+          "passed": true
+        },
+        {
+          "evidence": "verify_apex_enforcement.py executed a direct forbidden call and the pinned middleware rejected it",
+          "id": "forbidden_tool_invocation_rejected",
+          "passed": true
+        }
+      ],
+      "modes_tested": [
+        "deployment",
+        "self_evolving",
+        "task_specific"
+      ],
+      "status": "passed"
+    }
+  }
+}

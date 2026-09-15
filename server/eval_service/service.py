@@ -22,8 +22,14 @@ Run from ``server/`` so ``eval_service`` imports as a package:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
+import math
+import mimetypes
 import os
+import shlex
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -31,12 +37,24 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import ale_codex_runner, ale_docker_grader, ale_grader, loader, resources, usage
+from . import (
+    ale_codex_runner,
+    ale_docker_grader,
+    ale_grader,
+    ale_manifest,
+    ale_verifier_capture,
+    ale_verifier_registry,
+    adapter_registry,
+    authtokens,
+    loader,
+    resources,
+    usage,
+)
 from .contract import GradeResult, SessionView, TaskView, VerifierView
 from .environment import (
     GradingNotSupported,
@@ -52,7 +70,19 @@ logger = logging.getLogger("eval_service")
 # --------------------------------------------------------------------------- #
 # Config                                                                      #
 # --------------------------------------------------------------------------- #
+# Bounds *idleness*, not total life: every session-scoped request pushes the
+# deadline out again (see _touch). It used to be an absolute lifetime, which
+# reaped clients that were plainly still working -- pulling a task's inputs one
+# file at a time over a slow link takes hours on the heaviest ALE tasks, and the
+# session died mid-download every time.
 SESSION_TTL_SEC = int(os.environ.get("EVAL_SERVICE_SESSION_TTL_SEC", "1800"))
+# Backstop for the one case an idle timeout can't catch: a client that keeps
+# touching a session forever (a wedged retry loop) would otherwise pin its
+# workspace and gym DBs for the life of the process. Set well above any honest
+# session -- the slowest input download plus a full-length agent run. 0 disables.
+SESSION_MAX_LIFETIME_SEC = int(
+    os.environ.get("EVAL_SERVICE_SESSION_MAX_LIFETIME_SEC", "43200")
+)
 REAPER_INTERVAL_SEC = int(os.environ.get("EVAL_SERVICE_REAPER_INTERVAL_SEC", "60"))
 # Seeding is the heavy op (large SQL); cap concurrent seeds across all clients.
 MAX_CONCURRENT_SEEDS = int(os.environ.get("EVAL_SERVICE_MAX_CONCURRENT_SEEDS", "4"))
@@ -60,6 +90,7 @@ MAX_CONCURRENT_SEEDS = int(os.environ.get("EVAL_SERVICE_MAX_CONCURRENT_SEEDS", "
 # advertises a publicly reachable base (else it's inferred from X-Forwarded-Host
 # or the request URL).
 PUBLIC_URL = os.environ.get("EVAL_SERVICE_PUBLIC_URL", "").strip().rstrip("/")
+DEFAULT_OPENAI_MODEL = os.environ.get("EVAL_SERVICE_OPENAI_MODEL", "gpt-5").strip() or "gpt-5"
 MCP_PROXY_TIMEOUT = float(os.environ.get("EVAL_SERVICE_MCP_TIMEOUT_SEC", "300"))
 # MCP streamable-HTTP headers we forward each way (request -> gym, gym -> client).
 _MCP_REQ_HEADERS = {"content-type", "accept", "mcp-session-id",
@@ -109,6 +140,9 @@ class Session:
     status: str = "active"         # active | graded | closed | expired
     last_grade: dict[str, Any] | None = None
     resource_mode: str = "none"    # oracle | accumulative | none
+    # Kept per-session so _touch honours a caller's ttl_sec override, not just
+    # the service default, every time it renews the deadline.
+    ttl_sec: float = float(SESSION_TTL_SEC)
     # EOG only: {gym_name: {"url": <real gym mcp url>, "headers": {...}}}. The
     # client-facing action carries proxied URLs; these are the real targets the
     # /v1/sessions/{id}/mcp/{gym} proxy forwards to (binding each call to this DB).
@@ -184,16 +218,18 @@ class RunAgentBody(BaseModel):
       * ``evovling_agents`` -> Codex multi-agent (orchestrator + subagents).
 
     ``agent`` overrides that auto-choice (``react`` | ``codex`` | ``auto``).
-    Provide ``openai_api_key`` to run with the caller's own key (written to a
+    ``openai_api_key`` is required: the service hosts the environment, the
+    harness and the grader, but the inference is yours to pay for, so there is
+    no fallback to the host's key (400 if omitted). It is written to a
     per-trial API-key ``auth.json`` for Codex, or used as the OpenAI key for
-    ReAct); omit it to use the host's own credentials. Grade afterwards with
-    ``POST .../grade`` (the agent's tool calls mutated this session's DB).
+    ReAct. Grade afterwards with ``POST .../grade`` (the agent's tool calls
+    mutated this session's DB).
     """
     agent: str | None = Field(
         None, description="which reference agent: react|codex|auto (default: auto by dataset)")
     openai_api_key: str | None = Field(
-        None, description="OpenAI API key used to run the agent (else the host's credentials)")
-    model: str | None = Field(None, description="model (default: server's configured model)")
+        None, description="REQUIRED: your OpenAI API key; the agent runs on it (no host fallback)")
+    model: str | None = Field(None, description="model (default: gpt-5)")
     transport: str | None = Field(
         None, description="Codex only: stdio|streamable_http (default: server's configured transport)")
     restrict_to_selected_tools: bool = Field(
@@ -281,6 +317,10 @@ async def _usage_middleware(request: Request, call_next):
             status=response.status_code,
             duration_ms=(time.perf_counter() - t0) * 1000.0,
             client=request.headers.get("user-agent", ""),
+            # The public proxy removes any caller-supplied copy and sets this
+            # only after resolving a per-user eval key. Direct/shared-key and
+            # historical requests intentionally share the unknown bucket.
+            user=request.headers.get("x-eval-user", usage.UNKNOWN_USER),
             dataset=request.query_params.get("dataset"),
         )
     except Exception as e:  # noqa: BLE001 - telemetry must never break a request
@@ -306,11 +346,18 @@ def _task_view(sess: Session) -> TaskView:
     except Exception as e:  # noqa: BLE001 - never fail the view over resources
         logger.warning("resource resolve failed for %s: %s", row.task_id, e)
         res = None
+    public_metadata = (
+        ale_grader.public_task_metadata(row)
+        if sess.benchmark == "ale"
+        else {"required_steps": [], "evaluation": ""}
+    )
     return TaskView(
         selector=sel,
         task_id=row.task_id,
         system_prompt=row.system_prompt,
         user_prompt=row.user_prompt,
+        required_steps=public_metadata["required_steps"],
+        evaluation=public_metadata["evaluation"],
         oracle_tools=list(getattr(row, "selected_tools", []) or []),
         resources=res,
     )
@@ -342,8 +389,11 @@ async def _start_reaper() -> None:
     except Exception as e:  # noqa: BLE001 - never block startup on telemetry
         logger.warning("usage: replay failed: %s", e)
     # Best-effort: ensure the client SDK wheel exists so GET /sdk can serve it
-    # (dist/ is gitignored, so a fresh checkout starts with none).
-    if _latest_wheel() is None:
+    # (dist/ is gitignored, so a fresh checkout starts with none), and that it
+    # is not older than the source -- otherwise editing the SDK and restarting
+    # keeps handing every caller the previous build, which is silent and only
+    # shows up as a client that lacks whatever you just added.
+    if _sdk_wheel_is_stale():
         try:
             await asyncio.to_thread(_build_sdk_wheel, PUBLIC_URL)
             logger.info("built SDK wheel: %s", _latest_wheel())
@@ -417,12 +467,24 @@ async def _teardown(sess: Session, mark: str = "closed") -> None:
 # --------------------------------------------------------------------------- #
 @app.get("/v1/health")
 def health() -> dict[str, Any]:
+    verifier_coverage = ale_verifier_registry.coverage(ale_manifest.runnable_ids())
+    verifier_coverage["source"] = ale_verifier_registry.source_coverage(
+        ale_grader.ALE_ROOT / "tasks"
+    )
+    verifier_coverage["runtime"] = ale_verifier_capture.runtime_diagnostics()
+    verifier_coverage["complete"] = bool(
+        verifier_coverage["complete"]
+        and verifier_coverage["source"]["complete"]
+        and not verifier_coverage["runtime"]["tasks_with_failures"]
+    )
     return {
         "ok": True,
         "data_root": str(loader.DATA_ROOT),
         "active_sessions": sum(1 for s in SESSIONS.values() if s.status == "active"),
         "ttl_sec": SESSION_TTL_SEC,
         "ale_docker": ale_docker_grader.availability(),
+        "ale_tasks": ale_manifest.availability(),
+        "ale_verifiers": verifier_coverage,
     }
 
 
@@ -433,9 +495,10 @@ def usage_summary(top: int = Query(20, ge=1, le=200)) -> dict[str, Any]:
     ``top_by_calls`` ranks endpoints by request count (how popular each is);
     every row carries server-side latency percentiles, so ``top_by_latency_p95``
     surfaces the current bottleneck. ``by_hour``/``by_day`` are the over-time
-    series and ``by_client`` attributes traffic by ``User-Agent`` (the SDK tags
-    itself, so you can separate SDK usage from browsers/curl). Full history lives
-    in the JSONL at ``log_path`` (survives restarts; replayed on startup).
+    series, ``by_client`` attributes traffic by ``User-Agent`` (the SDK tags
+    itself), and ``by_user`` / ``user_usage`` report the authenticated identity
+    and its endpoints/datasets. Full history lives in the JSONL at ``log_path``
+    (survives restarts; replayed on startup).
     """
     return USAGE.summary(top=top)
 
@@ -455,20 +518,369 @@ def usage_dashboard() -> HTMLResponse:
 
 # --------------------------------------------------------------------------- #
 # SDK distribution                                                            #
-# The service ships its own client. Anyone who can reach the service can       #
-# `pip install` the wheel below -- no PyPI account or repo checkout needed:    #
-#     pip install "$BASE_URL/sdk/<wheel>"   (filename via GET /sdk)            #
-#                                                                              #
-# In this repo the client SDK is the top level and the service lives under     #
-# `server/`, so the source to build from is two directories up. Point          #
-# `EVAL_SERVICE_SDK_SRC` at a `pyproject.toml` directory to build a different  #
-# client (e.g. an installed checkout kept elsewhere).                          #
+# The service ships its own client to authenticated users. Fetch the manifest  #
+# and wheel with the eval key, then install the downloaded local wheel.         #
 # --------------------------------------------------------------------------- #
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _SDK_SRC = Path(
-    os.environ.get("EVAL_SERVICE_SDK_SRC", "")
-    or Path(__file__).resolve().parent.parent.parent
+    os.environ.get("EVAL_SERVICE_SDK_SRC", _REPOSITORY_ROOT)
+).expanduser().resolve()
+_SDK_DIST = Path(
+    os.environ.get("EVAL_SERVICE_SDK_DIST", _SDK_SRC / "dist")
+).expanduser().resolve()
+_EVAL_SKILL_ROOT = (Path(__file__).parent / "skills" / "evolve-eval").resolve()
+_EVAL_SKILL = (_EVAL_SKILL_ROOT / "SKILL.md").resolve()
+_EVAL_SKILL_SUFFIXES = {".md", ".json", ".py"}
+_BENCHMARK_SKILL_ROOT = (
+    Path(__file__).parent / "skills" / "evolve-benchmark"
 ).resolve()
-_SDK_DIST = _SDK_SRC / "dist"
+_BENCHMARK_SKILL_SUFFIXES = {".md", ".json", ".py"}
+_SKILL_TOKEN_STORE = authtokens.default_store()
+_SKILL_SHARED_API_KEY = os.environ.get("EVAL_SERVICE_API_KEY", "").strip()
+
+
+def _presented_eval_key(request: Request) -> str:
+    authorization = request.headers.get("authorization", "").strip()
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return request.headers.get("x-api-key", "").strip()
+
+
+def _require_download_api_key(request: Request) -> None:
+    """Require the same credential as evaluation calls for served downloads."""
+    key = _presented_eval_key(request)
+    if key and _SKILL_SHARED_API_KEY and hmac.compare_digest(
+        key, _SKILL_SHARED_API_KEY
+    ):
+        return
+    if key and _SKILL_TOKEN_STORE.enabled and _SKILL_TOKEN_STORE.verify(key):
+        return
+
+    broken = _SKILL_TOKEN_STORE.enabled and not _SKILL_TOKEN_STORE.healthy
+    if not _SKILL_SHARED_API_KEY and not _SKILL_TOKEN_STORE.enabled:
+        broken = True
+    raise HTTPException(
+        status_code=503 if broken else 401,
+        detail=authtokens.unauthorized_detail(bool(key), broken=broken),
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _installer_auth_denial(detail: str) -> PlainTextResponse:
+    """Return only an executable denial stub, never protected installer code.
+
+    ``curl -f`` discards every 4xx body. A small successful shell response is
+    therefore the only way the conventional ``curl -fsSL ... | bash`` pipeline
+    can print actionable authentication guidance. The stub always exits 22.
+    """
+    body = (
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' "
+        + shlex.quote(f"Authentication required: {detail}")
+        + " >&2\n"
+        "exit 22\n"
+    )
+    return PlainTextResponse(
+        body,
+        media_type="text/x-shellscript",
+        headers={
+            "Cache-Control": "no-store",
+            "WWW-Authenticate": 'Bearer realm="eval-service"',
+            "X-Eval-Auth-Required": "true",
+        },
+    )
+
+
+def _render_eval_skill(request: Request) -> PlainTextResponse:
+    """Serve the portable skill with this deployment's reachable base URL."""
+    if not _EVAL_SKILL.is_file():
+        raise HTTPException(status_code=404, detail="evolve-eval skill is not installed")
+    body = _EVAL_SKILL.read_text(encoding="utf-8").replace(
+        "__BASE_URL__", _public_base(request)
+    )
+    return PlainTextResponse(
+        body,
+        media_type="text/markdown",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get(
+    "/resources/skill.md",
+    response_class=PlainTextResponse,
+    include_in_schema=False,
+    dependencies=[Depends(_require_download_api_key)],
+)
+@app.get(
+    "/resources/evolve-eval/SKILL.md",
+    response_class=PlainTextResponse,
+    include_in_schema=False,
+    dependencies=[Depends(_require_download_api_key)],
+)
+def evolve_eval_skill(request: Request) -> PlainTextResponse:
+    """Serve authenticated portable evaluation-skill instructions."""
+    return _render_eval_skill(request)
+
+
+def _eval_skill_files(request: Request) -> list[dict[str, str]]:
+    """Rendered files in the authenticated, checksum-verified eval skill."""
+    if not _EVAL_SKILL.is_file():
+        raise HTTPException(status_code=404, detail="evolve-eval skill is not installed")
+    base = _public_base(request)
+    files: list[dict[str, str]] = []
+    for path in sorted(_EVAL_SKILL_ROOT.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in _EVAL_SKILL_SUFFIXES:
+            continue
+        relative = path.relative_to(_EVAL_SKILL_ROOT).as_posix()
+        rendered = path.read_text(encoding="utf-8").replace("__BASE_URL__", base)
+        files.append({
+            "path": relative,
+            "url": f"{base}/resources/evolve-eval/{relative}",
+            "sha256": hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+        })
+    return files
+
+
+@app.get(
+    "/resources/evolve-eval/manifest.json",
+    include_in_schema=False,
+    dependencies=[Depends(_require_download_api_key)],
+)
+def evolve_eval_manifest(request: Request) -> dict[str, Any]:
+    files = _eval_skill_files(request)
+    return {
+        "name": "evolve-eval",
+        "base_url": _public_base(request),
+        "files": files,
+        "package_sha256": hashlib.sha256(
+            json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+@app.get(
+    "/resources/evolve-eval/install.sh",
+    response_class=PlainTextResponse,
+    include_in_schema=False,
+)
+def evolve_eval_installer(request: Request) -> PlainTextResponse:
+    """Install every manifest-listed skill file after SHA-256 verification."""
+    try:
+        _require_download_api_key(request)
+    except HTTPException as exc:
+        return _installer_auth_denial(str(exc.detail))
+    base = _public_base(request)
+    body = f'''#!/usr/bin/env bash
+set -euo pipefail
+
+python - <<'PY'
+import hashlib, json, os, pathlib, urllib.request
+base = {json.dumps(base)}
+key = os.environ.get("EVAL_SERVICE_API_KEY", "").strip()
+if not key:
+    raise RuntimeError("EVAL_SERVICE_API_KEY is required")
+dest = pathlib.Path(os.environ.get(
+    "EVOLVE_EVAL_SKILL_DIR",
+    pathlib.Path(os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex")) / "skills" / "evolve-eval",
+)).expanduser().resolve()
+headers = {{"Authorization": f"Bearer {{key}}", "ngrok-skip-browser-warning": "true"}}
+def fetch(url):
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers)) as response:
+        return response.read()
+manifest = json.loads(fetch(base + "/resources/evolve-eval/manifest.json"))
+for item in manifest["files"]:
+    relative = pathlib.PurePosixPath(item["path"])
+    if relative.is_absolute() or ".." in relative.parts:
+        raise RuntimeError(f"unsafe skill path: {{relative}}")
+    content = fetch(item["url"])
+    actual = hashlib.sha256(content).hexdigest()
+    if actual != item["sha256"]:
+        raise RuntimeError(f"checksum mismatch for {{relative}}: {{actual}}")
+    target = (dest / pathlib.Path(*relative.parts)).resolve()
+    target.relative_to(dest)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".download")
+    temporary.write_bytes(content)
+    temporary.replace(target)
+print(f"Installed {{len(manifest['files'])}} verified files in {{dest}}")
+PY
+'''
+    return PlainTextResponse(body, media_type="text/x-shellscript",
+                             headers={"Cache-Control": "no-store"})
+
+
+@app.get(
+    "/resources/evolve-eval/{resource_path:path}",
+    response_class=Response,
+    include_in_schema=False,
+    dependencies=[Depends(_require_download_api_key)],
+)
+def evolve_eval_resource(request: Request, resource_path: str) -> Response:
+    if not resource_path or resource_path.startswith("."):
+        raise HTTPException(status_code=404, detail="skill resource not found")
+    candidate = (_EVAL_SKILL_ROOT / resource_path).resolve()
+    try:
+        candidate.relative_to(_EVAL_SKILL_ROOT)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="skill resource not found") from exc
+    if (not candidate.is_file()
+            or candidate.suffix.lower() not in _EVAL_SKILL_SUFFIXES
+            or candidate.name.startswith(".")):
+        raise HTTPException(status_code=404, detail="skill resource not found")
+    body = candidate.read_text(encoding="utf-8").replace(
+        "__BASE_URL__", _public_base(request)
+    )
+    media_type = ("text/markdown" if candidate.suffix.lower() == ".md"
+                  else mimetypes.guess_type(candidate.name)[0] or "text/plain")
+    return Response(content=body, media_type=media_type,
+                    headers={"Cache-Control": "no-store"})
+
+
+def _benchmark_skill_files(request: Request) -> list[dict[str, str]]:
+    """Rendered, checksummed files in the portable benchmark-building skill.
+
+    The package is deliberately allowlisted rather than exposing ``skills/`` as a
+    static directory.  References may contain the deployment placeholder, so the
+    manifest hashes the exact bytes a client receives from this request's public
+    base URL.
+    """
+    if not (_BENCHMARK_SKILL_ROOT / "SKILL.md").is_file():
+        raise HTTPException(status_code=404, detail="evolve-benchmark skill is not installed")
+    base = _public_base(request)
+    files: list[dict[str, str]] = []
+    for path in sorted(_BENCHMARK_SKILL_ROOT.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in _BENCHMARK_SKILL_SUFFIXES:
+            continue
+        relative = path.relative_to(_BENCHMARK_SKILL_ROOT).as_posix()
+        rendered = path.read_text(encoding="utf-8").replace("__BASE_URL__", base)
+        files.append({
+            "path": relative,
+            "url": f"{base}/resources/evolve-benchmark/{relative}",
+            "sha256": hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+        })
+    return files
+
+
+@app.get(
+    "/resources/evolve-benchmark/manifest.json",
+    include_in_schema=False,
+    dependencies=[Depends(_require_download_api_key)],
+)
+def evolve_benchmark_manifest(request: Request) -> dict[str, Any]:
+    """Authenticated install manifest for the construction skill package."""
+    files = _benchmark_skill_files(request)
+    return {
+        "name": "evolve-benchmark",
+        "base_url": _public_base(request),
+        "files": files,
+        "package_sha256": hashlib.sha256(
+            json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+@app.get(
+    "/resources/evolve-benchmark/install.sh",
+    response_class=PlainTextResponse,
+    include_in_schema=False,
+)
+def evolve_benchmark_installer(request: Request) -> PlainTextResponse:
+    """Serve a compact installer that verifies the complete manifest-listed skill."""
+    try:
+        _require_download_api_key(request)
+    except HTTPException as exc:
+        return _installer_auth_denial(str(exc.detail))
+    base = _public_base(request)
+    body = f'''#!/usr/bin/env bash
+set -euo pipefail
+
+python - <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import urllib.request
+
+base = {json.dumps(base)}
+eval_key = os.environ.get("EVAL_SERVICE_API_KEY", "").strip()
+if not eval_key:
+    raise RuntimeError("EVAL_SERVICE_API_KEY is required to download skill files")
+codex_home = pathlib.Path(os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex"))
+dest = pathlib.Path(
+    os.environ.get("EVOLVE_BUILD_SKILL_DIR", codex_home / "skills" / "evolve-benchmark")
+).expanduser().resolve()
+
+def fetch(url):
+    request = urllib.request.Request(
+        url,
+        headers={{
+            "Authorization": f"Bearer {{eval_key}}",
+            "ngrok-skip-browser-warning": "true",
+        }},
+    )
+    with urllib.request.urlopen(request) as response:
+        return response.read()
+
+manifest = json.loads(fetch(base + "/resources/evolve-benchmark/manifest.json"))
+for item in manifest["files"]:
+    relative = pathlib.PurePosixPath(item["path"])
+    if relative.is_absolute() or ".." in relative.parts:
+        raise RuntimeError(f"unsafe skill path: {{relative}}")
+    content = fetch(item["url"])
+    actual = hashlib.sha256(content).hexdigest()
+    if actual != item["sha256"]:
+        raise RuntimeError(f"checksum mismatch for {{relative}}: {{actual}}")
+    target = (dest / pathlib.Path(*relative.parts)).resolve()
+    target.relative_to(dest)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".download")
+    temporary.write_bytes(content)
+    temporary.replace(target)
+
+print(f"Installed {{len(manifest['files'])}} verified files in {{dest}}")
+PY
+'''
+    return PlainTextResponse(
+        body,
+        media_type="text/x-shellscript",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get(
+    "/resources/evolve-benchmark/{resource_path:path}",
+    response_class=Response,
+    include_in_schema=False,
+    dependencies=[Depends(_require_download_api_key)],
+)
+def evolve_benchmark_resource(request: Request, resource_path: str) -> Response:
+    """Serve one manifest-listed construction-skill file, with path confinement."""
+    if not resource_path or resource_path.startswith("."):
+        raise HTTPException(status_code=404, detail="skill resource not found")
+    candidate = (_BENCHMARK_SKILL_ROOT / resource_path).resolve()
+    try:
+        candidate.relative_to(_BENCHMARK_SKILL_ROOT)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="skill resource not found") from exc
+    if (
+        not candidate.is_file()
+        or candidate.suffix.lower() not in _BENCHMARK_SKILL_SUFFIXES
+        or candidate.name.startswith(".")
+    ):
+        raise HTTPException(status_code=404, detail="skill resource not found")
+    body = candidate.read_text(encoding="utf-8").replace(
+        "__BASE_URL__", _public_base(request)
+    )
+    media_type = (
+        "text/markdown"
+        if candidate.suffix.lower() == ".md"
+        else mimetypes.guess_type(candidate.name)[0] or "text/plain"
+    )
+    return Response(
+        content=body,
+        media_type=media_type,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def _latest_wheel() -> Path | None:
@@ -480,8 +892,25 @@ def _latest_wheel() -> Path | None:
     return max(wheels, key=lambda p: p.stat().st_mtime)
 
 
+def _sdk_wheel_is_stale() -> bool:
+    """True when the served wheel is missing or older than the SDK source."""
+    wheel = _latest_wheel()
+    if wheel is None:
+        return True
+    package_dir = _SDK_SRC / "simple_agentic_evals"
+    newest = max(
+        (
+            p.stat().st_mtime
+            for p in [*package_dir.rglob("*.py"), _SDK_SRC / "pyproject.toml"]
+            if p.is_file()
+        ),
+        default=0.0,
+    )
+    return newest > wheel.stat().st_mtime
+
+
 def _build_sdk_wheel(public_url: str = "") -> None:
-    """Build the ``simple_agentic_evals`` wheel into ``dist/`` (served artifact).
+    """Build the ``simple_agentic_evals`` wheel into ``dist`` (served artifact).
 
     The wheel is a build artifact (``dist/`` is gitignored), so a fresh checkout
     has none; we build it on startup so ``GET /sdk`` always has something to serve.
@@ -495,7 +924,7 @@ def _build_sdk_wheel(public_url: str = "") -> None:
     import subprocess
     import sys
 
-    sdk_dir = _SDK_SRC  # the client checkout (has pyproject.toml)
+    sdk_dir = _SDK_SRC  # repository root (has pyproject.toml)
     if not public_url:
         subprocess.run(
             [sys.executable, "-m", "pip", "wheel", "--no-deps",
@@ -509,11 +938,15 @@ def _build_sdk_wheel(public_url: str = "") -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         build_src = Path(tmp) / "sdk"
+        build_src.mkdir()
+        shutil.copy2(sdk_dir / "pyproject.toml", build_src / "pyproject.toml")
+        readme = sdk_dir / "README.md"
+        if readme.is_file():
+            shutil.copy2(readme, build_src / "README.md")
         shutil.copytree(
-            sdk_dir, build_src,
-            ignore=shutil.ignore_patterns(
-                "dist", "build", "*.egg-info", "__pycache__", ".*", "server"
-            ),
+            sdk_dir / "simple_agentic_evals",
+            build_src / "simple_agentic_evals",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".*"),
         )
         (build_src / "simple_agentic_evals" / "_service.py").write_text(
             '"""Service endpoint baked in when this wheel was built by the service."""\n\n'
@@ -527,7 +960,7 @@ def _build_sdk_wheel(public_url: str = "") -> None:
         )
 
 
-@app.get("/sdk")
+@app.get("/sdk", dependencies=[Depends(_require_download_api_key)])
 def sdk_index(request: Request) -> dict[str, Any]:
     """Manifest for the bundled ``simple_agentic_evals`` client wheel.
 
@@ -539,7 +972,7 @@ def sdk_index(request: Request) -> dict[str, Any]:
     if wheel is None:
         raise HTTPException(
             status_code=404,
-            detail="SDK wheel not built (run, from the repo root: "
+            detail="SDK wheel not built (run from the repository root: "
             "pip wheel --no-deps -w dist .)",
         )
     base = _public_base(request)
@@ -548,11 +981,13 @@ def sdk_index(request: Request) -> dict[str, Any]:
         "filename": wheel.name,
         "path": f"/sdk/{wheel.name}",
         "base_url": base,
-        "pip_install": f"pip install '{base}/sdk/{wheel.name}'",
+        "requires_api_key": True,
+        "pip_install": f"pip install './{wheel.name}'",
+        "download_hint": "Download path with Authorization: Bearer <key>, then install the local wheel.",
     }
 
 
-@app.get("/sdk/{filename}")
+@app.get("/sdk/{filename}", dependencies=[Depends(_require_download_api_key)])
 def sdk_file(filename: str) -> FileResponse:
     """Serve a built SDK artifact so clients can ``pip install`` it directly."""
     fp = (_SDK_DIST / filename).resolve()
@@ -668,11 +1103,27 @@ async def create_session(body: CreateSessionBody, request: Request) -> dict[str,
         raise HTTPException(status_code=404, detail=str(e))
 
     env = get_environment(body.benchmark)
+    resource_view = resources.resolve(
+        dataset=body.dataset, benchmark=body.benchmark, version=ver,
+        domain=body.domain, row=row, mode=res_mode, include_content=False,
+    )
+    adapter_context = {
+        "dataset": body.dataset,
+        "benchmark": body.benchmark,
+        "version": ver,
+        "split": body.split,
+        "domain": body.domain,
+        "resource_mode": res_mode,
+        "resource": resource_view,
+    }
 
     # Provision the action surface (blocking I/O -> thread, capped concurrency).
     async with _SEED_SEM:
         try:
-            env_state, action = await asyncio.to_thread(env.create, row)
+            if body.benchmark in ("eog", "ale"):
+                env_state, action = await asyncio.to_thread(env.create, row)
+            else:
+                env_state, action = await asyncio.to_thread(env.create, row, adapter_context)
         except Exception as e:  # noqa: BLE001
             logger.exception("session create failed for %s", row.task_id)
             raise HTTPException(status_code=502, detail=f"environment provisioning failed: {e}")
@@ -697,7 +1148,7 @@ async def create_session(body: CreateSessionBody, request: Request) -> dict[str,
         dataset=body.dataset, benchmark=body.benchmark, version=ver,
         split=body.split, domain=body.domain, row=row, env_state=env_state,
         action=asdict(action), created_at=now, expires_at=now + ttl,
-        resource_mode=res_mode, mcp_targets=mcp_targets,
+        resource_mode=res_mode, mcp_targets=mcp_targets, ttl_sec=float(ttl),
     )
     async with _LOCK:
         SESSIONS[sess.session_id] = sess
@@ -714,12 +1165,27 @@ async def create_session(body: CreateSessionBody, request: Request) -> dict[str,
     return _session_view(sess)
 
 
+def _touch(sess: Session) -> None:
+    """Renew a session's idle deadline, up to its hard lifetime cap.
+
+    Every session-scoped endpoint goes through ``_require_session``, so any sign
+    of life renews the lease and a client that is steadily working is never
+    reaped out from under itself.
+    """
+    deadline = time.time() + sess.ttl_sec
+    if SESSION_MAX_LIFETIME_SEC > 0:
+        deadline = min(deadline, sess.created_at + SESSION_MAX_LIFETIME_SEC)
+    if deadline > sess.expires_at:
+        sess.expires_at = deadline
+
+
 def _require_session(session_id: str) -> Session:
     sess = SESSIONS.get(session_id)
     if sess is None:
         raise HTTPException(status_code=404, detail=f"no such session {session_id!r}")
     if sess.status in ("closed", "expired"):
         raise HTTPException(status_code=410, detail=f"session is {sess.status}")
+    _touch(sess)
     return sess
 
 
@@ -859,6 +1325,17 @@ def _resolve_agent_kind(sess: Session, requested: str | None) -> str:
     ALE only supports the CLI (Codex/ACP) harness, so ``react`` on an ALE task
     is a hard 400 -- the caller must use ``acp_codex_agent``.
     """
+    if sess.benchmark not in ("eog", "ale"):
+        item = adapter_registry.descriptor(sess.benchmark)
+        if item is None:
+            raise HTTPException(status_code=404, detail="benchmark adapter is not registered")
+        kind = (requested or "auto").strip().lower()
+        if kind in ("", "auto", "default", "reference", "managed", "official", "codex"):
+            return "managed"
+        raise HTTPException(
+            status_code=400,
+            detail=f"local adapter {item.adapter_id!r} exposes its official managed runner",
+        )
     kind = (requested or "auto").strip().lower()
     is_ale = sess.benchmark == "ale"
     if kind in ("", "auto", "default", "reference"):
@@ -1002,7 +1479,7 @@ async def _svc_run_react(sess: Session, body: RunAgentBody, session_id: str) -> 
         summary = await eog_react.run_react_session(
             sess.row, sess.action,
             openai_api_key=body.openai_api_key,
-            model=body.model,
+            model=body.model or DEFAULT_OPENAI_MODEL,
             restrict_to_selected_tools=bool(body.restrict_to_selected_tools),
             max_iterations=body.max_iterations,
             timeout_s=float(body.timeout_s) if body.timeout_s else 1800.0,
@@ -1020,10 +1497,9 @@ async def _svc_run_codex(sess: Session, body: RunAgentBody, session_id: str) -> 
     try:
         from evovle_skills.src.agent_runner import get_default_agent_runner
         from evovle_skills.src.config import CODEX_TIMEOUT_SEC, CODEX_TRANSPORT
+        from evovle_skills.src.endpoints import patch_row
     except Exception as e:  # noqa: BLE001 - harness Codex runner not importable
         raise HTTPException(status_code=501, detail=f"server-side Codex unavailable: {e}")
-
-    from ._harness.endpoints import patch_row
 
     import shutil as _shutil
     import tempfile as _tempfile
@@ -1057,7 +1533,7 @@ async def _svc_run_codex(sess: Session, body: RunAgentBody, session_id: str) -> 
             transport=(body.transport or CODEX_TRANSPORT),
             restrict_to_selected_tools=bool(body.restrict_to_selected_tools),
             openai_api_key=body.openai_api_key,
-            model=body.model,
+            model=body.model or DEFAULT_OPENAI_MODEL,
             max_episodes=body.max_episodes,
             mcp_only=body.mcp_only,
         )
@@ -1080,10 +1556,9 @@ async def _svc_run_codex_agents(sess: Session, body: RunAgentBody, session_id: s
         )
         from evovle_agents.src.modes import AgentMode
         from evovle_skills.src.config import CODEX_TIMEOUT_SEC, CODEX_TRANSPORT
+        from evovle_skills.src.endpoints import patch_row
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=501, detail=f"server-side agents unavailable: {e}")
-
-    from ._harness.endpoints import patch_row
 
     import shutil as _shutil
     import tempfile as _tempfile
@@ -1132,7 +1607,7 @@ async def _svc_run_codex_agents(sess: Session, body: RunAgentBody, session_id: s
             transport=(body.transport or CODEX_TRANSPORT),
             restrict_to_selected_tools=bool(body.restrict_to_selected_tools),
             openai_api_key=body.openai_api_key,
-            model=body.model,
+            model=body.model or DEFAULT_OPENAI_MODEL,
             memory_home=memory_home,
             memory_main_only=bool(body.memory_main_only),
         )
@@ -1187,7 +1662,8 @@ async def _svc_run_codex_ale(sess: Session, body: RunAgentBody, session_id: str)
     try:
         res = await asyncio.to_thread(
             ale_codex_runner.run_codex_ale,
-            task_obj, model=body.model, openai_api_key=body.openai_api_key,
+            task_obj, model=body.model or DEFAULT_OPENAI_MODEL,
+            openai_api_key=body.openai_api_key,
             multi_agent=multi, timeout_s=(float(body.timeout_s) if body.timeout_s else None),
             prompt_suffix=(suffix or ""), sandbox_env=sandbox_env,
         )
@@ -1199,14 +1675,14 @@ async def _svc_run_codex_ale(sess: Session, body: RunAgentBody, session_id: str)
 
     score = float(res["score"])
     passed = score >= ale_grader.SUCCESS_THRESHOLD
+    verifier_rows = ale_grader.verifier_records(res, grading_path="codex_inline")
     # Cache the inline grade so POST /grade returns it without re-running ale_run.
     grade = GradeResult(
         session_id=session_id, task_id=sess.row.task_id, overall_success=passed,
-        pass_rate=score, n_passed=1 if passed else 0, n_total=1,
-        per_verifier=[VerifierView(
-            name="ale_score", passed=passed,
-            expected=f">= {ale_grader.SUCCESS_THRESHOLD}", actual=round(score, 6),
-            comparison_type="ale_score:codex_inline", error=None)],
+        pass_rate=score,
+        n_passed=sum(bool(v["passed"]) for v in verifier_rows),
+        n_total=len(verifier_rows),
+        per_verifier=[VerifierView(**v) for v in verifier_rows],
     )
     sess.last_grade = asdict(grade)
     sess.env_state["_inline_graded"] = True
@@ -1246,6 +1722,40 @@ async def _svc_run_codex_ale(sess: Session, body: RunAgentBody, session_id: str)
     }
 
 
+# The host's OpenAI key exists so the operator can run the harness locally; it
+# is not a service the public shares. Every runner would otherwise inherit it
+# (the ReAct/ALE child env copies os.environ, and Codex falls back to
+# ~/.codex/auth.json), so a caller who simply omits the field would silently
+# bill inference to us. Refuse instead, and say which of the two keys is
+# missing -- they are easy to confuse, and the service key alone gets you this
+# far, so the failure lands only once a run is attempted.
+ALLOW_HOST_OPENAI_KEY = os.environ.get("EVAL_SERVICE_ALLOW_HOST_OPENAI_KEY", "0") == "1"
+
+
+def _require_caller_openai_key(key: str | None, *, field: str, what: str) -> None:
+    """400 unless the caller brought their own OpenAI key for ``what``."""
+    if (key or "").strip() or ALLOW_HOST_OPENAI_KEY:
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"{what} needs your own OpenAI API key: pass {field}. This service "
+            "hosts the environment, the harnesses and the grader, but it does "
+            "not pay for your agent's inference, so it will not fall back to "
+            "the host's key.\n"
+            "Two different keys are involved:\n"
+            "  - the eval service key (from MyAuthtoken) authenticates you to "
+            "this service -- yours already worked, or you would not be here;\n"
+            "  - an OpenAI API key runs the model. Get one at "
+            "https://platform.openai.com/api-keys .\n"
+            "SDK: react_agent(task, api_key=...) / acp_codex_agent(task, "
+            "api_key=...). HTTP: {\"openai_api_key\": \"sk-...\"}.\n"
+            "Bringing your own agent (BYOA) needs no key here -- you call your "
+            "model yourself and only use this service for tools and grading."
+        ),
+    )
+
+
 async def _run_agent_session(session_id: str, body: RunAgentBody) -> dict[str, Any]:
     """Dispatch a server-side reference-agent run for this session.
 
@@ -1255,6 +1765,59 @@ async def _run_agent_session(session_id: str, body: RunAgentBody) -> dict[str, A
     """
     sess = _require_session(session_id)
     kind = _resolve_agent_kind(sess, body.agent)  # 400s on react-for-ALE
+    if sess.benchmark not in ("eog", "ale"):
+        item = adapter_registry.descriptor(sess.benchmark)
+        env = get_environment(sess.benchmark)
+        runner = getattr(env, "run_agent", None)
+        if item is None or not callable(runner):
+            raise HTTPException(status_code=501, detail="local adapter has no managed run_agent hook")
+        missing = [
+            name for name in item.credentials
+            if not ((name == "OPENAI_API_KEY" and (body.openai_api_key or "").strip())
+                    or os.environ.get(name, "").strip())
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail="local adapter is missing required environment credentials: "
+                       + ", ".join(missing),
+            )
+        logger.info("run_agent %s benchmark=%s adapter=%s",
+                    session_id, sess.benchmark, item.adapter_id)
+        started = time.monotonic()
+        try:
+            summary = await asyncio.to_thread(runner, sess.row, sess.env_state, body)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("managed adapter run failed for %s", session_id)
+            raise HTTPException(status_code=502, detail=f"managed adapter run failed: {exc}")
+        if not isinstance(summary, dict):
+            raise HTTPException(status_code=502, detail="managed adapter returned a non-object result")
+        inline = summary.pop("_grade", None)
+        if inline is not None:
+            try:
+                verifier_rows = [VerifierView(**row) for row in inline.get("per_verifier", [])]
+                grade = GradeResult(
+                    session_id=session_id,
+                    task_id=sess.row.task_id,
+                    overall_success=bool(inline["overall_success"]),
+                    pass_rate=float(inline["pass_rate"]),
+                    n_passed=int(inline["n_passed"]),
+                    n_total=int(inline["n_total"]),
+                    per_verifier=verifier_rows,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise HTTPException(status_code=502, detail=f"invalid adapter inline grade: {exc}")
+            if not math.isfinite(grade.pass_rate):
+                raise HTTPException(status_code=502, detail="adapter returned a non-finite grade")
+            sess.last_grade = asdict(grade)
+            sess.env_state["_inline_graded"] = True
+        summary.setdefault("session_id", session_id)
+        summary.setdefault("agent", kind)
+        summary.setdefault("latency_s", round(time.monotonic() - started, 3))
+        return summary
+    _require_caller_openai_key(
+        body.openai_api_key, field="openai_api_key",
+        what="Running the reference agent on the service")
     logger.info("run_agent %s dataset=%s benchmark=%s agent=%s",
                 session_id, sess.dataset, sess.benchmark, kind)
     _t0 = time.monotonic()
@@ -1307,9 +1870,12 @@ async def _submit_or_run(
     sess = _require_session(session_id)          # 404/410 before accepting a job
     if not body.background:
         return await _run_agent_session(session_id, body)
-    # Surface obvious rejections (e.g. react-on-ALE -> 400) on the submit call
-    # itself rather than burying them in a polled job error.
+    # Surface obvious rejections (e.g. react-on-ALE, or no OpenAI key -> 400) on
+    # the submit call itself rather than burying them in a polled job error.
     _resolve_agent_kind(sess, body.agent)
+    _require_caller_openai_key(
+        body.openai_api_key, field="openai_api_key",
+        what="Running the reference agent on the service")
     job = Job(job_id="job_" + uuid.uuid4().hex[:16], session_id=session_id,
               created_at=time.time(), updated_at=time.time())
     JOBS[job.job_id] = job
@@ -1350,7 +1916,7 @@ class ConsolidateMemoryBody(BaseModel):
     label: str = Field(
         "manual", description="Names this pass in the home's _consolidate/ log; "
                               "the agents track uses the curriculum version, e.g. v2.")
-    model: str | None = Field(None, description="Model for the consolidation pass.")
+    model: str | None = Field(None, description="Model for the consolidation pass (default: gpt-5).")
     api_key: str | None = Field(
         None, description="OpenAI key for the pass; falls back to the service's.")
     root_only: bool = Field(
@@ -1382,6 +1948,9 @@ async def consolidate_memory(body: ConsolidateMemoryBody) -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=501,
                             detail=f"server-side agents unavailable: {e}")
+    _require_caller_openai_key(
+        body.api_key, field="api_key",
+        what="Consolidating a memory home (it runs Codex over the home)")
     assert_memory_supported()
     home = service_memory_home(body.memory_key)
     if not home.is_dir():
@@ -1390,7 +1959,7 @@ async def consolidate_memory(body: ConsolidateMemoryBody) -> dict[str, Any]:
             detail=f"no memory home for key {body.memory_key!r}; run its train "
                    "split with memory_key first")
     return await consolidate_memory_home(
-        home, label=body.label, model=body.model,
+        home, label=body.label, model=body.model or DEFAULT_OPENAI_MODEL,
         openai_api_key=body.api_key, root_only=bool(body.root_only))
 
 
@@ -1421,21 +1990,24 @@ async def get_job(session_id: str, job_id: str) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# ALE sandbox: serve inputs + accept the agent's submitted artifact           #
+# Sandbox action: serve inputs + accept the agent's submitted artifact        #
 # --------------------------------------------------------------------------- #
-def _require_ale(sess: Session) -> dict[str, Any]:
-    if sess.env_state.get("kind") != "ale":
+def _require_sandbox(sess: Session) -> dict[str, Any]:
+    if sess.action.get("type") != "sandbox":
         raise HTTPException(
             status_code=400,
-            detail="not a sandbox (ALE) session; inputs/submit apply to benchmark=ale only",
+            detail="inputs/submit apply only to a sandbox action",
         )
-    return sess.env_state
+    state = sess.env_state
+    if not state.get("base_dir") or not state.get("output_dir"):
+        raise HTTPException(status_code=502, detail="sandbox adapter omitted workspace paths")
+    return state
 
 
 @app.get("/v1/sessions/{session_id}/inputs")
 def list_inputs(session_id: str) -> dict[str, Any]:
     sess = _require_session(session_id)
-    st = _require_ale(sess)
+    st = _require_sandbox(sess)
     from pathlib import Path
     return {
         "session_id": session_id,
@@ -1447,7 +2019,7 @@ def list_inputs(session_id: str) -> dict[str, Any]:
 @app.get("/v1/sessions/{session_id}/inputs/{rel_path:path}")
 def get_input(session_id: str, rel_path: str):
     sess = _require_session(session_id)
-    st = _require_ale(sess)
+    st = _require_sandbox(sess)
     from pathlib import Path
     try:
         fp = ale_grader.resolve_input_file(Path(st["base_dir"]), rel_path)
@@ -1493,7 +2065,7 @@ def get_run_artifacts(session_id: str):
 @app.post("/v1/sessions/{session_id}/submit")
 def submit_artifact(session_id: str, body: SubmitBody) -> dict[str, Any]:
     sess = _require_session(session_id)
-    st = _require_ale(sess)
+    st = _require_sandbox(sess)
     from pathlib import Path
     try:
         written = ale_grader.write_submission(

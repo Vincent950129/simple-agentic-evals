@@ -44,18 +44,20 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ._harness.config import EOG_ROOT
-
 logger = logging.getLogger("eval_service.eog_react")
 
-# The EnterpriseOps-Gym reference tree (benchmark/, orchestrators/, ...); set
-# ``$EOG_ROOT`` when the gym sources live outside this checkout.
+# The EnterpriseOps-Gym reference tree (benchmark/, orchestrators/, ...).
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_REFERENCE = EOG_ROOT
+_REFERENCE = Path(
+    os.environ.get("EOG_ROOT", _REPO_ROOT / "reference" / "EnterpriseOps-Gym")
+).resolve()
 
 # Default ReAct model when the caller doesn't pass one (OpenAI, matching the
 # reference LLMClient's ``openai`` provider path).
-DEFAULT_REACT_MODEL = os.environ.get("EVAL_SERVICE_REACT_MODEL", "gpt-4o")
+DEFAULT_REACT_MODEL = os.environ.get(
+    "EVAL_SERVICE_REACT_MODEL",
+    os.environ.get("EVAL_SERVICE_OPENAI_MODEL", "gpt-5"),
+)
 DEFAULT_MAX_TOKENS = int(os.environ.get("EVAL_SERVICE_REACT_MAX_TOKENS", "16384"))
 
 
@@ -126,7 +128,10 @@ def build_payload(
     agent at this service's MCP proxy (via ``self_base``) so it acts on exactly
     the DB the verifier will read -- no re-discovery, no re-seed.
     """
-    from ._harness.endpoints import patch_row
+    try:
+        from evovle_skills.src.endpoints import patch_row
+    except ImportError:
+        from ._harness.endpoints import patch_row
 
     patched = patch_row(row)
     return {

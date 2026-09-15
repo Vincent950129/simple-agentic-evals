@@ -1,19 +1,27 @@
 # simple-agentic-evals
 
-**A lightweight, server-only client for evaluating language models** — inspired by
-[openai/simple-evals](https://github.com/openai/simple-evals), but for *agentic*
-benchmarks. It currently covers **EoG** (EnterpriseOps-Gym) and **ALE** (Agents'
-Last Exam).
+An SDK and self-hostable service for evaluating agents on evolving,
+verifier-backed benchmarks. It is inspired by
+[openai/simple-evals](https://github.com/openai/simple-evals), but evaluates what
+an agent changes in a tool environment or filesystem rather than only its text.
+The hosted adapters cover **EOG** (EnterpriseOps-Gym) and **ALE** (Agents' Last
+Exam); reviewed local adapters can expose additional benchmarks through the same
+contract.
 
 The **Evolving-Benchmarks Evaluation Service** hosts everything executable — the
 environment (EoG Docker gyms + the ALE Docker sandbox), the **provided agent
 harnesses**, and the grader. This client is a thin wrapper over its HTTP API: you
 connect, pick a task, run a harness (or bring your own), and read the score.
 **Nothing heavy runs on your machine** — no Docker gyms, no ALE sandbox, no
-`codex` binary, no datasets to download. The only dependencies are `httpx` and
-`pydantic`.
+`codex` binary, no datasets to download. The only dependency is `httpx`.
 
-- **Provided harnesses** (run *on the service*; you just pass your OpenAI `api_key`):
+- **Provided harnesses** (run *on the service*; you pass your OpenAI `api_key`,
+  or set `$OPENAI_API_KEY`). The key is **required** — the service hosts the
+  environment, the harness and the grader, but the inference is yours to pay
+  for, so there is no fallback to the host's credentials. Note this is a
+  *different* key from the eval service key that `EvalClient(api_key=...)`
+  takes: that one gets you into the service, this one runs the model. Bringing
+  your own agent needs no OpenAI key here at all.
   - `react_agent` — EnterpriseOps-Gym's reference **ReAct** agent. **EOG only.**
   - `acp_codex_agent` — **Codex over ACP**. For **EOG** it acts on the task's gym
     MCP tools (skills/agents/tools; the agents track runs the reference multi-agent
@@ -27,9 +35,16 @@ connect, pick a task, run a harness (or bring your own), and read the score.
 - **Bring your own agent** — `to_openai_tools` turns the gym's MCP tools into
   OpenAI-ready function specs; hand `task.mcp_servers` to any MCP client.
 - **Continual-learning metrics** — `ContinualMetrics` (ACC / BWT / FWT / forgetting).
+- **Diagnostic detail** — per-task, per-verifier results; ALE also exposes safe
+  nested checks plus the public required steps and natural-language rubric.
+- **Operations** — per-user request analytics, a separate localhost dashboard,
+  key-gated SDK/skill downloads, and hot-reloaded personal token stores.
 
-The service itself lives in [`server/`](server/README.md) — run your own if you
-want to host the gyms, the ALE sandbox and the graders yourself.
+The repository contains the installable SDK at the root, the deployable service
+under [`server/`](server/README.md), current notebooks under [`tutorials/`](tutorials/),
+and portable agent skills under `server/eval_service/skills/`. Runtime data,
+credentials, analytics databases, generated wheels, and benchmark datasets are
+deliberately excluded from Git.
 
 ## Install
 
@@ -38,8 +53,12 @@ from a running service — no PyPI account or repo checkout needed:
 
 ```bash
 BASE=http://localhost:8077        # or your public URL
-WHEEL=$(curl -s "$BASE/sdk" | python -c 'import json,sys; print(json.load(sys.stdin)["path"])')
-pip install "$BASE$WHEEL"
+: "${EVAL_SERVICE_API_KEY:?Get a key from MyAuthtoken first}"
+WHEEL=$(curl -sSL -H "Authorization: Bearer $EVAL_SERVICE_API_KEY" "$BASE/sdk" \
+  | python -c 'import json,sys; d=json.load(sys.stdin); print(d["path"]) if "path" in d else sys.exit("SDK download denied: " + d.get("detail", "unknown error"))')
+curl -fsSL -H "Authorization: Bearer $EVAL_SERVICE_API_KEY" \
+  "$BASE$WHEEL" -o "${WHEEL##*/}"
+pip install "./${WHEEL##*/}"
 ```
 
 Or, from a checkout of this repo:
@@ -51,6 +70,62 @@ pip install -e .
 Both provided harnesses run **on the service**, so you need no gym, no ALE sandbox,
 no model client, and no `codex` binary locally. (Only the *bring-your-own-agent*
 examples that call OpenAI directly need `pip install openai`.)
+
+## Interactive skill and isolated command runs
+
+For a quick interactive dry run, an agent can read the portable instructions from
+`GET /resources/evolve-eval/SKILL.md` (alias: `/resources/skill.md`). Downloading
+the Markdown and all `/v1` evaluation calls require an eval key. The installed
+wheel separately provides `CommandAgent`, `run_leaderboard`, and the
+`evolve-eval` CLI for repeatable fresh-process runs.
+
+The general benchmark-construction skill and its checksummed references are
+also key-protected. Install them from
+`GET /resources/evolve-benchmark/install.sh`; the installer verifies every file
+against `GET /resources/evolve-benchmark/manifest.json`.
+It converts a verifier-backed seed suite into evolving tools, skills, or agents
+datasets locally; it does not call the hosted evaluation API or publish outputs.
+
+```bash
+export EVAL_SERVICE_API_KEY=...                  # do not put this on the command line
+: "${EVAL_SERVICE_API_KEY:?Required — sign in at https://mas-orchestra.salesforceresearch.ai/mas_r1/demo/ and open MyAuthtoken}" &&
+curl -fsSL -H "Authorization: Bearer $EVAL_SERVICE_API_KEY" \
+  "$EVAL_SERVICE_URL/resources/evolve-eval/SKILL.md" -o SKILL.md
+evolve-eval leaderboard --adapter codex --name "My Agent" --output ./eval-run
+# or any fresh-process CLI that reads its prompt from stdin
+evolve-eval leaderboard --agent-command 'my-agent --stdin' --name "My Agent" --output ./eval-run
+```
+
+The default is a one-seed smoke test with two tasks per benchmark. Its
+`leaderboard.json` is marked `partial`. A publishable run has no task limit and
+three seeds; because it can consume many agent-hours and millions of model tokens,
+both flags are required:
+
+```bash
+evolve-eval leaderboard --adapter codex --name "My Agent" --output ./full-run \
+  --full --confirm-full-cost
+```
+
+Every task uses a new process and workspace. The prompt arrives on stdin and the
+workspace paths are supplied as `EVAL_TASK_JSON`, `EVAL_INPUT_DIR`,
+`EVAL_OUTPUT_DIR`, and `EVAL_RESOURCE_DIR`. An optional `usage.json` reports
+`total_tokens` and `n_steps`. The three datasets materialize respectively as an
+enforced MCP tool allowlist, `SKILL.md` bundles, or agent TOMLs plus
+`agent_skills`; Codex also receives task-scoped skill discovery and multi-agent
+configuration. Checkpoints support `--resume`, and `--cleanup` removes task
+workspaces after success. The key is inherited only through the environment and
+is redacted from captured logs.
+
+The Python API applies the same guard: a no-limit `run_leaderboard(...)` call
+requires `confirm_full_cost=True`; rehearsal calls with `limit=` do not.
+The returned and saved `leaderboard.json` remains a leaderboard row and also
+includes `task_results`: benchmark → seed → task rows, with every task's
+`per_verifier` measurements retained for diagnosis.
+
+For a same-conversation rehearsal, use `evolve-eval start`, `status`, `grade`,
+and `abort`. Interactive results are always partial because they do not provide
+fresh-conversation isolation. The CLI writes/prints leaderboard JSON only; it
+does not upload or centrally rank results.
 
 ## Quickstart
 
@@ -90,9 +165,35 @@ with client.task("evovling_skills", "eog", 1, task_id, domain="hr") as task:
     run   = acp_codex_agent(task, api_key="sk-...")
     grade = task.grade()
     print("accuracy:", grade.pass_rate)        # from grading
+    for verifier in grade.per_verifier:        # EOG and ALE verifier rows
+        print(verifier["name"], verifier.get("score"), verifier["passed"])
     print("latency :", run.latency_s, "s")     # wall-clock of the run
     print("tokens  :", run.total_tokens)        # total LLM tokens (in+out)
 ```
+
+Every grade returns `per_verifier`. Each row includes `name`, `score`, `passed`,
+`expected`, `actual`, `comparison_type`, `description`, `details`, and `error`.
+For ALE, the public task-card guidance is also available after the task starts:
+
+```python
+with task:
+    print(task.required_steps)  # ordered task-card agentMustDo entries
+    print(task.evaluation)      # public natural-language scoring rubric
+```
+
+These fields are task metadata, not measured results; measured component scores
+remain in `task.grade().per_verifier`. Hidden reference files and values are not
+included.
+
+ALE task evaluators preserve their named top-level components and safe nested
+checks. The service validates every capture policy against the evaluator source
+and reports capture drift in `/v1/health`. The one currently scalar-only ALE
+task returns `ale_score` with `details.granularity == "atomic"`; an unexpected
+aggregate fallback is marked `aggregate_fallback` with `extraction_error` rather
+than being presented as a complete verifier breakdown. If an evaluator rejects
+missing or malformed artifacts before constructing its component report, the
+result is an explicit `evaluation_preconditions` row with
+`details.granularity == "precondition_failure"`.
 
 `task.evaluate(...)` runs a harness **then grades**, bundling all three into an
 `EvalReport`:
@@ -122,7 +223,7 @@ for task in client.tasks("evovling_tools", "eog", domain="hr", version=1, limit=
 
 # EOG skills / agents -> Codex over ACP
 with client.task("evovling_skills", "eog", 1, task_id, domain="hr") as task:
-    run = acp_codex_agent(task, api_key="sk-...", model="gpt-5-codex")
+    run = acp_codex_agent(task, api_key="sk-...", model="gpt-5")
     print(task.grade().pass_rate, run.total_tokens)
 
 # ALE -> Codex CLI agent inside the sandbox (solves + grades)
@@ -259,28 +360,43 @@ for k, acc in enumerate(per_stage_scores):        # R[k][k] diagonal
 print(m.print_report())                           # ACC, BWT, FWT, forgetting
 ```
 
-## Running your own service
+## Tutorials
 
-Everything above talks to a hosted service. If you want to run it yourself —
-to point at your own gyms, add benchmarks, or keep evaluation inside your
-network — the server is in [`server/`](server/README.md):
+- [`tutorials/evolve_eval_colab_tutorial_quick_start.ipynb`](tutorials/evolve_eval_colab_tutorial_quick_start.ipynb)
+  is the shortest end-to-end path.
+- [`tutorials/evolve_eval_colab_tutorial_quick_start_detail.ipynb`](tutorials/evolve_eval_colab_tutorial_quick_start_detail.ipynb)
+  explains the same workflow in more detail.
+- [`tutorials/evolve_eval_colab_tutorial_full.ipynb`](tutorials/evolve_eval_colab_tutorial_full.ipynb)
+  covers EOG, ALE task inputs, public steps/rubrics, and detailed verifier results.
+- [`evolve_eval_colab_tutorial.ipynb`](evolve_eval_colab_tutorial.ipynb) remains a
+  compatibility copy of the full tutorial.
+
+The setup cells send `Authorization: Bearer $EVAL_SERVICE_API_KEY` when fetching
+`/sdk`; this is required because SDK and skill downloads are gated just like the
+evaluation API.
+
+## Self-hosting
+
+The SDK is lightweight; the service is not. A service host needs the benchmark
+datasets plus the EOG gyms and/or ALE checkout and sandbox image. Once those are
+available:
 
 ```bash
+pip install -e .
 pip install -r server/requirements.txt
-EOG_ROOT=/path/to/EnterpriseOps-Gym \
-ALE_ROOT=/path/to/agents-last-exam \
-EVAL_SERVICE_DATA_ROOT=/path/to/datasets \
-  bash server/run.sh                      # http://0.0.0.0:8077
+export EVAL_SERVICE_DATA_ROOT=/data/evolving-benchmarks
+export EOG_ROOT=/data/EnterpriseOps-Gym                 # when serving EOG
+export ALE_ROOT=/data/agents-last-exam                  # when serving ALE
+bash server/run.sh                                      # 0.0.0.0:8077
 ```
 
-```python
-client = EvalClient("http://localhost:8077")
-```
-
-It serves this SDK back at `GET /sdk` (built from the repo root on startup), so
-clients can `pip install` straight from your instance. See
-[`server/README.md`](server/README.md) for prerequisites, the endpoint
-reference, configuration, and deployment notes.
+For public access, run `bash server/ngrok_tunnel.sh` with `NGROK_TOKEN` and a
+shared `EVAL_SERVICE_API_KEY`, or mount personal tokens at
+`server/eval_service/auth/authtokens.db`. The public proxy authenticates `/v1/*`,
+`/sdk`, and `/resources/*`; personal-key activity is attributed to its non-secret
+user label and updates `last_used`. See the [server documentation](server/README.md)
+for configuration, security boundaries, dashboard setup, ALE verifier capture,
+and deployment notes.
 
 ## API surface
 
@@ -292,13 +408,17 @@ reference, configuration, and deployment notes.
   - `.tasks(...)` → iterator of `Task`; `.task(..., task_id=...)` → one `Task`
   - `.resources(dataset, benchmark, version, task_id=None, split="test", domain=None, mode=None, include_content=True)`
 - `Task` (context manager): `benchmark`, `dataset`, `system_prompt`, `user_prompt`,
-  `oracle_tools`, `resources`, `action_type`, `mcp_servers`, `mcp_url(server)`,
+  `required_steps`, `evaluation`, `oracle_tools`, `resources`, `action_type`,
+  `mcp_servers`, `mcp_url(server)`,
   `mcp_session(server)`, `inputs()`, `fetch_input(path)`, `submit(...)`,
   `submit_text(path, text)`, `output_path`, `grade(keep_alive=False)` → `GradeResult`,
   `evaluate(agent="acp_codex", *, keep_alive=False, **kw)` → `EvalReport`
-- `GradeResult`: `pass_rate`, `overall_success`, `n_passed`, `n_total`, `per_verifier`
+- `GradeResult`: `pass_rate`, `overall_success`, `n_passed`, `n_total`,
+  `per_verifier` (named score/pass/detail rows for EOG and ALE)
 - `EvalReport`: `accuracy`, `latency_s`, `total_tokens`, `input_tokens`,
   `output_tokens`, `overall_success`, `agent`, `run`, `grade`
+- `BenchmarkReport`: headline metrics plus `.task_results` (one row per task,
+  including `per_verifier`) and `.verifier_results` (flattened task × verifier rows)
 - `MCPSession`: `list_tools()`, `call_tool(name, arguments)`, `close()`
 - `ServiceError`: raised on any non-2xx response — `.status_code`, `.detail`,
   `.needs_sandbox` (True for ALE 501s). Lets you handle errors without importing `httpx`.
