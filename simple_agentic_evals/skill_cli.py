@@ -210,6 +210,7 @@ def _leaderboard(args: argparse.Namespace) -> int:
             output_dir=output,
             timeout=args.timeout,
             keep_workspaces=not args.cleanup,
+            ale_execution=args.ale_execution,
         )
     adapter_metadata = None
     if local_inspected:
@@ -267,7 +268,15 @@ def _start(args: argparse.Namespace) -> int:
     ))
     try:
         task.start()
-        paths = materialize_task_workspace(task, root / "task", codex=False)
+        remote = args.benchmark == "ale" and args.ale_execution == "remote_mcp"
+        remote_server = None
+        if remote:
+            task.start_remote_sandbox()
+            remote_server = task.remote_mcp_server
+        paths = materialize_task_workspace(
+            task, root / "task", codex=False,
+            fetch_sandbox_inputs=not remote, remote_mcp_server=remote_server,
+        )
         state = {
             "status": "active",
             "session_id": task.session_id,
@@ -279,6 +288,7 @@ def _start(args: argparse.Namespace) -> int:
             "resource_mode": args.resource_mode,
             "task_id": task.task_id,
             "workspace": str(paths["root"]),
+            "ale_execution": args.ale_execution,
         }
         _atomic_json(state_path, state)
     except Exception:
@@ -310,7 +320,12 @@ def _status(args: argparse.Namespace) -> int:
         return 0
     client = EvalClient()
     remote = client._get(f"/v1/sessions/{state['session_id']}")
-    _json({**state, "remote": remote})
+    result = {**state, "remote": remote}
+    if state.get("ale_execution") == "remote_mcp":
+        result["remote_sandbox"] = client._get(
+            f"/v1/sessions/{state['session_id']}/ale/remote/status"
+        )
+    _json(result)
     return 0
 
 
@@ -320,6 +335,7 @@ def _task_from_state(client: EvalClient, state: dict[str, Any]):
         state.get("split", "test"), state.get("domain"), state.get("resource_mode"),
     )
     task.session_id = state["session_id"]
+    task._remote_execution_started = state.get("ale_execution") == "remote_mcp"
     return task
 
 
@@ -329,7 +345,7 @@ def _grade(args: argparse.Namespace) -> int:
         raise SystemExit(f"interactive task is {state.get('status')!r}, not active")
     client = EvalClient()
     task = _task_from_state(client, state)
-    if state["benchmark"] == "ale":
+    if state["benchmark"] == "ale" and state.get("ale_execution") != "remote_mcp":
         task.submit_dir(root / "task" / "output")
     grade = task.grade(keep_alive=False)
     result = {
@@ -465,6 +481,10 @@ def _parser() -> argparse.ArgumentParser:
     lead.add_argument("--local-port", type=int, default=8078)
     lead.add_argument("--output")
     lead.add_argument("--timeout", type=float, default=1800)
+    lead.add_argument(
+        "--ale-execution", choices=("artifact", "remote_mcp"), default="artifact",
+        help="ALE only: local file adapter (default) or hosted sandbox MCP",
+    )
     lead.add_argument("--resume", action="store_true")
     lead.add_argument("--cleanup", action="store_true", help="remove per-task workspaces after success")
     lead.add_argument("--full", action="store_true", help="all selected tasks, three repeats")
@@ -476,6 +496,10 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--benchmark", default="eog")
     start.add_argument("--domain")
     start.add_argument("--resource-mode", choices=("oracle", "accumulative", "none"), default="accumulative")
+    start.add_argument(
+        "--ale-execution", choices=("artifact", "remote_mcp"), default="artifact",
+        help="ALE only: local artifact rehearsal (default) or hosted sandbox MCP",
+    )
     start.add_argument("--output")
     start.set_defaults(func=_start)
 

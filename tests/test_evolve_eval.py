@@ -195,6 +195,35 @@ def test_resource_materialization_skills_and_agents(tmp_path):
     assert json.loads(paths["task_json"].read_text())["allowed_tools"] == ["calendar_search"]
 
 
+def test_remote_ale_workspace_uses_env_auth_and_keeps_inputs_remote(tmp_path):
+    resource = {"kind": "agents", "mode": "accumulative", "names": [], "items": []}
+    task = _Task(resource)
+    task.dataset = "evovling_agents"
+    task.benchmark = "ale"
+    remote = SimpleNamespace(
+        name="ale_sandbox", path="/v1/sessions/s/ale/mcp",
+        url="https://eval.example/v1/sessions/s/ale/mcp", headers={},
+    )
+    paths = materialize_task_workspace(
+        task, tmp_path / "remote", codex=True, fetch_sandbox_inputs=False,
+        remote_mcp_server=remote,
+    )
+    config = (paths["root"] / ".codex/config.toml").read_text()
+    state = paths["state_json"].read_text()
+    assert '[mcp_servers.ale_sandbox]' in config
+    assert 'bearer_token_env_var = "EVAL_SERVICE_API_KEY"' in config
+    assert 'default_tools_approval_mode = "approve"' in config
+    assert "secret-eval-key" not in config + state
+    assert list(paths["input_dir"].iterdir()) == []
+
+
+def test_command_agent_ale_execution_is_additive_and_opt_in():
+    assert CommandAgent(["true"]).ale_execution == "artifact"
+    assert CommandAgent(["true"], ale_execution="remote_mcp").ale_execution == "remote_mcp"
+    with pytest.raises(ValueError, match="ale_execution"):
+        CommandAgent(["true"], ale_execution="replace")
+
+
 def test_command_agent_isolates_tasks_reports_usage_and_redacts_keys(tmp_path):
     resource = {"kind": "skills", "mode": "none", "names": [], "items": []}
     command = [

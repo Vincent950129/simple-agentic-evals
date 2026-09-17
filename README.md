@@ -12,8 +12,10 @@ The **Evolving-Benchmarks Evaluation Service** hosts everything executable — t
 environment (EoG Docker gyms + the ALE Docker sandbox), the **provided agent
 harnesses**, and the grader. This client is a thin wrapper over its HTTP API: you
 connect, pick a task, run a harness (or bring your own), and read the score.
-**Nothing heavy runs on your machine** — no Docker gyms, no ALE sandbox, no
-`codex` binary, no datasets to download. The only dependency is `httpx`.
+The service always owns the benchmark environment and grader. The default
+artifact and provided-harness paths need no local Docker gym or ALE image. The
+optional local-orchestration path needs only the user's agent CLI; its ALE
+sandbox and official evaluator still run on the service.
 
 - **Provided harnesses** (run *on the service*; you pass your OpenAI `api_key`,
   or set `$OPENAI_API_KEY`). The key is **required** — the service hosts the
@@ -26,7 +28,7 @@ connect, pick a task, run a harness (or bring your own), and read the score.
   - `acp_codex_agent` — **Codex over ACP**. For **EOG** it acts on the task's gym
     MCP tools (skills/agents/tools; the agents track runs the reference multi-agent
     orchestrator). For **ALE** it drives the Codex CLI agent inside the sandbox
-    (solve **and** grade). This is the only supported harness for ALE.
+    (solve **and** grade).
 - **Three metrics, every run** — **accuracy** (`grade().pass_rate`), **latency**
   (`run.latency_s`), **tokens** (`run.total_tokens`); use `task.evaluate(...)` to
   get all three at once as an `EvalReport`.
@@ -68,8 +70,8 @@ pip install -e .
 ```
 
 Both provided harnesses run **on the service**, so you need no gym, no ALE sandbox,
-no model client, and no `codex` binary locally. (Only the *bring-your-own-agent*
-examples that call OpenAI directly need `pip install openai`.)
+no model client, and no `codex` binary locally. (Only bring-your-own-agent paths
+need their own agent runtime.)
 
 ## Interactive skill and isolated command runs
 
@@ -329,6 +331,35 @@ with client.task("evovling_skills", "ale", 3, "legal/legal_dr_fees_01") as task:
 Some ALE tasks need an environment we can't provide here (e.g. Windows-only) and return
 HTTP 501; `grade()` then raises `ServiceError` with `.needs_sandbox == True`.
 
+### ALE with local orchestration and a hosted sandbox
+
+This mode is opt-in. `CommandAgent` still uses the artifact workflow unless
+`ale_execution="remote_mcp"` is set. In remote mode, each local agent process and
+its subagents share one session-scoped hosted ALE filesystem through the
+`ale_sandbox` MCP server; after the process exits, `Task.grade()` closes MCP and
+runs the unchanged official evaluator once.
+
+```python
+from simple_agentic_evals import CommandAgent, EvalClient
+
+client = EvalClient()
+task = client.task("evovling_agents", "ale", "full",
+                   "business_finance/american_option_pricing_ls")
+agent = CommandAgent(adapter="codex", ale_execution="remote_mcp",
+                     output_dir="./ale-remote-run")
+
+with task:
+    run = agent(task)             # local Codex/subagents, hosted ALE MCP
+    grade = task.grade()          # official aggregate + per_verifier
+    print(grade.pass_rate, grade.execution_mode)
+```
+
+For manual orchestration, call `task.start_remote_sandbox()` and read
+`task.remote_mcp_server`; `task.remote_sandbox_status()` reports provisioning and
+execution state. The server must be enabled by its operator. The eval key is
+supplied to child agents only through the environment and is not written to task
+files or captured logs.
+
 ## Continual learning — advanced (the evolving axis)
 
 Each dataset evolves a resource (tools / skills / agents). Choose a stage (`version`, or
@@ -412,9 +443,13 @@ and deployment notes.
   `mcp_servers`, `mcp_url(server)`,
   `mcp_session(server)`, `inputs()`, `fetch_input(path)`, `submit(...)`,
   `submit_text(path, text)`, `output_path`, `grade(keep_alive=False)` → `GradeResult`,
+  `start_remote_sandbox()`, `remote_sandbox_status()`, `remote_mcp_server`,
   `evaluate(agent="acp_codex", *, keep_alive=False, **kw)` → `EvalReport`
 - `GradeResult`: `pass_rate`, `overall_success`, `n_passed`, `n_total`,
-  `per_verifier` (named score/pass/detail rows for EOG and ALE)
+  `per_verifier` (named score/pass/detail rows for EOG and ALE), optional
+  `execution_mode`
+- `CommandAgent(..., ale_execution="artifact" | "remote_mcp")`; the default is
+  the existing local-artifact workflow.
 - `EvalReport`: `accuracy`, `latency_s`, `total_tokens`, `input_tokens`,
   `output_tokens`, `overall_success`, `agent`, `run`, `grade`
 - `BenchmarkReport`: headline metrics plus `.task_results` (one row per task,

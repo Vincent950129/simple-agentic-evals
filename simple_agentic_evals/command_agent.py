@@ -81,7 +81,9 @@ def _action_type(task: Any) -> str:
     return "mcp" if getattr(task, "benchmark", "") == "eog" else "sandbox"
 
 
-def _codex_project_config(workspace: Path, resource: Mapping[str, Any]) -> None:
+def _codex_project_config(
+    workspace: Path, resource: Mapping[str, Any], remote_mcp_server: Any | None = None,
+) -> None:
     """Expose task-scoped skills and agent definitions without copying auth."""
     skills_target = workspace / ".agents" / "skills"
     skills_target.mkdir(parents=True, exist_ok=True)
@@ -98,6 +100,21 @@ def _codex_project_config(workspace: Path, resource: Mapping[str, Any]) -> None:
                 shutil.copy2(child, target)
 
     lines = ["[features]", "multi_agent = true", ""]
+    if remote_mcp_server is not None:
+        url = str(remote_mcp_server.url).replace("\\", "\\\\").replace('"', '\\"')
+        lines += [
+            "[mcp_servers.ale_sandbox]",
+            f'url = "{url}"',
+            'bearer_token_env_var = "EVAL_SERVICE_API_KEY"',
+            "required = true",
+            # This server is created only after the caller explicitly selects
+            # ale_execution=remote_mcp. Non-interactive Codex cannot answer an
+            # approval prompt, so approve this task-scoped server's tools.
+            'default_tools_approval_mode = "approve"',
+            "startup_timeout_sec = 60",
+            "tool_timeout_sec = 3600",
+            "",
+        ]
     agents_root = workspace / "resources" / "agents"
     metadata = {str(i.get("name")): i for i in resource.get("items") or []}
     if agents_root.is_dir():
@@ -112,7 +129,10 @@ def _codex_project_config(workspace: Path, resource: Mapping[str, Any]) -> None:
     cfg.write_text("\n".join(lines), encoding="utf-8")
 
 
-def materialize_task_workspace(task: Any, workspace: str | Path, *, codex: bool = False) -> dict[str, Any]:
+def materialize_task_workspace(
+    task: Any, workspace: str | Path, *, codex: bool = False,
+    fetch_sandbox_inputs: bool = True, remote_mcp_server: Any | None = None,
+) -> dict[str, Any]:
     """Create the documented task/input/output/resource command contract."""
     root = Path(workspace).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -123,7 +143,7 @@ def materialize_task_workspace(task: Any, workspace: str | Path, *, codex: bool 
 
     resource = _task_resource(task)
     _write_resources(resource_dir, resource)
-    if _action_type(task) == "sandbox":
+    if _action_type(task) == "sandbox" and fetch_sandbox_inputs:
         task.fetch_inputs_to(input_dir)
 
     allowed = list(resource.get("names") or []) if resource.get("kind") == "tools" else []
@@ -152,7 +172,7 @@ def materialize_task_workspace(task: Any, workspace: str | Path, *, codex: bool 
         "session_id": task.session_id,
         "servers": [
             {"name": server.name, "path": server.path, "url": task.mcp_url(server)}
-            for server in task.mcp_servers
+            for server in ([remote_mcp_server] if remote_mcp_server is not None else task.mcp_servers)
         ],
         "allowed_tools": allowed,
         "enforce_allowlist": resource.get("kind") == "tools",
@@ -160,7 +180,7 @@ def materialize_task_workspace(task: Any, workspace: str | Path, *, codex: bool 
     state_json = root / ".task-state.json"
     state_json.write_text(json.dumps(state, indent=2), encoding="utf-8")
     if codex:
-        _codex_project_config(root, resource)
+        _codex_project_config(root, resource, remote_mcp_server)
     return {
         "root": root,
         "task_json": task_json,
@@ -223,11 +243,14 @@ class CommandAgent:
         output_dir: str | Path = "evolve-eval-runs",
         timeout: float = 1800,
         keep_workspaces: bool = True,
+        ale_execution: str = "artifact",
     ):
         if adapter not in ("command", "codex"):
             raise ValueError("adapter must be 'command' or 'codex'")
         if adapter == "command" and not command:
             raise ValueError("command adapter requires a command")
+        if ale_execution not in ("artifact", "remote_mcp"):
+            raise ValueError("ale_execution must be 'artifact' or 'remote_mcp'")
         self.adapter = adapter
         self.command = shlex.split(command) if isinstance(command, str) else list(command or [])
         self.adapt_command = (
@@ -239,6 +262,7 @@ class CommandAgent:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.timeout = float(timeout)
         self.keep_workspaces = keep_workspaces
+        self.ale_execution = ale_execution
 
     def _argv(self) -> list[str]:
         if self.adapter == "codex":
@@ -308,13 +332,29 @@ class CommandAgent:
     def __call__(self, task: Any, **_: Any) -> dict[str, Any]:
         label = f"{_safe_name(task.benchmark)}-{_safe_name(task.task_id)}-{uuid.uuid4().hex[:8]}"
         workspace = self.output_dir / "tasks" / label
-        paths = materialize_task_workspace(task, workspace, codex=self.adapter == "codex")
+        remote = task.benchmark == "ale" and self.ale_execution == "remote_mcp"
+        remote_server = None
+        if remote:
+            task.start_remote_sandbox(timeout=min(self.timeout, 900.0))
+            remote_server = task.remote_mcp_server
+            if remote_server is None:
+                raise CommandAgentError("remote ALE sandbox did not advertise its MCP server")
+        paths = materialize_task_workspace(
+            task, workspace, codex=self.adapter == "codex",
+            fetch_sandbox_inputs=not remote, remote_mcp_server=remote_server,
+        )
         prompt = "\n\n".join(p for p in (task.system_prompt, task.user_prompt) if p).strip() + "\n"
         action_type = _action_type(task)
         if action_type == "mcp":
             prompt += (
                 "\nUse `evolve-eval tool list` and `evolve-eval tool call NAME --arguments JSON` "
                 "to act on the task. Only listed tools are permitted.\n"
+            )
+        elif action_type == "sandbox" and remote:
+            prompt += (
+                "\nThis ALE task runs in the hosted sandbox. Use the ale_sandbox MCP tools for "
+                "all terminal, filesystem, PTY, clipboard, and desktop work. The local input/output "
+                "directories are intentionally empty and are not the graded environment.\n"
             )
         elif action_type == "sandbox":
             prompt += "\nRead EVAL_INPUT_DIR and write the requested deliverable under EVAL_OUTPUT_DIR.\n"
@@ -388,9 +428,11 @@ class CommandAgent:
             usage_file.write_text(json.dumps(usage, indent=2), encoding="utf-8")
         elif self.adapter == "codex":
             usage = _usage_from_codex_json(proc.stdout)
-        if action_type == "sandbox" and any(paths["output_dir"].rglob("*")):
+        if action_type == "sandbox" and not remote and any(paths["output_dir"].rglob("*")):
             task.submit_dir(paths["output_dir"])
         result = {"latency_s": time.time() - started, **usage}
+        if remote:
+            result["execution_mode"] = "remote_mcp"
         if not self.keep_workspaces:
             shutil.rmtree(workspace)
         return result

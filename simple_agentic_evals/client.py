@@ -149,6 +149,7 @@ class GradeResult:
     n_passed: int
     n_total: int
     per_verifier: list[dict[str, Any]] = field(default_factory=list)
+    execution_mode: str | None = None
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -160,6 +161,7 @@ class GradeResult:
             n_passed=int(d.get("n_passed", 0) or 0),
             n_total=int(d.get("n_total", 0) or 0),
             per_verifier=list(d.get("per_verifier") or []),
+            execution_mode=(str(d["execution_mode"]) if d.get("execution_mode") else None),
             raw=d,
         )
 
@@ -217,6 +219,8 @@ class Task:
         # {"kind","mode","count","names",[...]}. Empty unless a mode was requested.
         self.resources: dict[str, Any] = {}
         self.action: dict[str, Any] = {}
+        self._remote_mcp_server: McpServer | None = None
+        self._remote_execution_started: bool = False
 
     # -- lifecycle ---------------------------------------------------------- #
     def start(self) -> "Task":
@@ -242,6 +246,8 @@ class Task:
                 self._client._delete(f"/v1/sessions/{self.session_id}")
             finally:
                 self.session_id = None
+                self._remote_mcp_server = None
+                self._remote_execution_started = False
 
     def __enter__(self) -> "Task":
         return self.start()
@@ -283,6 +289,69 @@ class Task:
 
         headers = {**self._client.headers, **(server.headers or {})}
         return MCPSession(self.mcp_url(server), headers=headers, timeout=timeout)
+
+    def start_remote_sandbox(
+        self, *, wait: bool = True, timeout: float = 600.0, poll_interval: float = 1.0,
+    ) -> dict[str, Any]:
+        """Start the opt-in hosted ALE sandbox used by local orchestration.
+
+        This does not change the session's existing ``sandbox`` artifact action.
+        It adds a session-scoped MCP server that exposes the hosted terminal,
+        filesystem, PTY, clipboard, and desktop. The deployment must explicitly
+        enable ``EVAL_SERVICE_REMOTE_ALE_ENABLED``.
+        """
+        self._need_session()
+        if self.benchmark != "ale":
+            raise ValueError("remote sandboxes are available only for ALE tasks")
+        data = self._client._post(
+            f"/v1/sessions/{self.session_id}/ale/remote/start", None
+        )
+        self._remote_execution_started = True
+        server = data.get("mcp_server")
+        if isinstance(server, dict):
+            self._remote_mcp_server = McpServer.from_dict(server)
+        if not wait:
+            return data
+        deadline = time.monotonic() + float(timeout)
+        while data.get("status") in ("queued", "provisioning"):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"remote ALE sandbox did not become ready within {timeout}s")
+            time.sleep(max(0.05, float(poll_interval)))
+            data = self.remote_sandbox_status()
+        if data.get("status") != "ready":
+            raise RuntimeError(data.get("error") or f"remote ALE sandbox ended as {data.get('status')}")
+        return data
+
+    def remote_sandbox_status(self) -> dict[str, Any]:
+        """Return safe lifecycle/resource status for this task's remote sandbox."""
+        self._need_session()
+        return self._client._get(
+            f"/v1/sessions/{self.session_id}/ale/remote/status"
+        )
+
+    @property
+    def remote_mcp_server(self) -> McpServer | None:
+        """The remote ALE MCP server after :meth:`start_remote_sandbox`."""
+        return self._remote_mcp_server
+
+    def _finish_remote_sandbox(
+        self, *, timeout: float = 9000.0, poll_interval: float = 1.0,
+    ) -> dict[str, Any]:
+        self._need_session()
+        data = self.remote_sandbox_status()
+        if data.get("status") == "ready":
+            data = self._client._post(
+                f"/v1/sessions/{self.session_id}/ale/remote/finish", None
+            )
+        deadline = time.monotonic() + float(timeout)
+        while data.get("status") in ("queued", "provisioning", "finishing"):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"remote ALE evaluation did not finish within {timeout}s")
+            time.sleep(max(0.05, float(poll_interval)))
+            data = self.remote_sandbox_status()
+        if data.get("status") != "finished":
+            raise RuntimeError(data.get("error") or f"remote ALE evaluation ended as {data.get('status')}")
+        return data
 
     @property
     def sandbox(self) -> dict[str, Any]:
@@ -419,6 +488,8 @@ class Task:
     # -- grading ------------------------------------------------------------ #
     def grade(self, keep_alive: bool = False) -> GradeResult:
         self._need_session()
+        if self._remote_execution_started:
+            self._finish_remote_sandbox()
         d = self._client._post(
             f"/v1/sessions/{self.session_id}/grade",
             None, params={"keep_alive": str(keep_alive).lower()},

@@ -27,6 +27,20 @@ For Codex use `--adapter codex`. Each task gets a new process and workspace.
 An adaptation command additionally receives `EVAL_ADAPT_STAGE_JSON` and a
 persistent `EVAL_STATE_DIR`.
 
+ALE defaults to the existing local artifact contract. When the deployment
+advertises remote ALE MCP and the user explicitly wants local orchestration with
+a shared hosted filesystem, use:
+
+```bash
+evolve-eval leaderboard --benchmarks ale --adapter codex \
+  --ale-execution remote_mcp --name 'My Agent' --output ./eval-run
+```
+
+This starts one hosted sandbox per isolated task process. Codex receives a
+session-scoped `ale_sandbox` Streamable HTTP MCP server; its subagents use the
+same server. Grading first disables that act surface and then runs the official
+ALE evaluator once. Never fall back from `remote_mcp` to artifacts silently.
+
 Resume an interrupted leaderboard with identical flags plus `--resume`.
 Background service runs return a job id; poll its session job endpoint until
 `done` or `error`, then grade. Use the service usage/dashboard endpoints and

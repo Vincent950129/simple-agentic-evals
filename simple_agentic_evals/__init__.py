@@ -111,4 +111,4 @@ __all__ = [
     "ContinualMetrics", "StageResult",
     "catalog_targets", "inspect_adapter", "resolve_target", "serve_local",
 ]
-__version__ = "0.18.2"
+__version__ = "0.19.0"
