@@ -1,6 +1,6 @@
 [project]
 name = "simple-agentic-evals"
-version = "0.19.0"
+version = "0.19.1"
 description = "Hosted/local client, isolated command adapter, and general evolving-benchmark evaluator."
 readme = "README.md"
 requires-python = ">=3.9"

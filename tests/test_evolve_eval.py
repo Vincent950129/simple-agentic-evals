@@ -196,7 +196,19 @@ def test_resource_materialization_skills_and_agents(tmp_path):
 
 
 def test_remote_ale_workspace_uses_env_auth_and_keeps_inputs_remote(tmp_path):
-    resource = {"kind": "agents", "mode": "accumulative", "names": [], "items": []}
+    resource = {
+        "kind": "agents", "mode": "accumulative", "names": ["helper"],
+        "items": [{
+            "name": "helper", "description": "Remote helper",
+            "files": [{
+                "path": "evovling_agents/ale/full/agents/helper.toml",
+                "content": (
+                    'name = "helper"\n[tools]\nexec_command = true\n'
+                    'shell_tool = true\napply_patch = true\n'
+                ),
+            }],
+        }],
+    }
     task = _Task(resource)
     task.dataset = "evovling_agents"
     task.benchmark = "ale"
@@ -215,6 +227,14 @@ def test_remote_ale_workspace_uses_env_auth_and_keeps_inputs_remote(tmp_path):
     assert 'default_tools_approval_mode = "approve"' in config
     assert "secret-eval-key" not in config + state
     assert list(paths["input_dir"].iterdir()) == []
+    agent = (paths["resource_dir"] / "agents/helper.toml").read_text()
+    assert 'sandbox_mode = "read-only"' in agent
+    assert "exec_command = false" in agent
+    assert "shell_tool = false" in agent
+    assert "apply_patch = false" in agent
+    assert "[mcp_servers.ale_sandbox]" in agent
+    assert 'bearer_token_env_var = "EVAL_SERVICE_API_KEY"' in agent
+    assert "secret-eval-key" not in agent
 
 
 def test_command_agent_ale_execution_is_additive_and_opt_in():

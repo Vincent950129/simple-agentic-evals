@@ -358,7 +358,14 @@ For manual orchestration, call `task.start_remote_sandbox()` and read
 `task.remote_mcp_server`; `task.remote_sandbox_status()` reports provisioning and
 execution state. The server must be enabled by its operator. The eval key is
 supplied to child agents only through the environment and is not written to task
-files or captured logs.
+files or captured logs. For Codex, the materialized project binds this MCP server
+directly to each selected specialist and disables its local shell/file mutation
+tools, so subagents act on the shared hosted task filesystem rather than an empty
+local command workspace.
+
+See [`tutorials/eval_service_demo_ale.ipynb`](tutorials/eval_service_demo_ale.ipynb)
+for a minimal fixed-plan example where local Codex spawns two specialists, both
+operate on one hosted ALE filesystem, and the service returns the official score.
 
 ## Continual learning — advanced (the evolving axis)
 

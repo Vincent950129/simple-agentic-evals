@@ -99,10 +99,19 @@ def _codex_project_config(
             elif child.is_file():
                 shutil.copy2(child, target)
 
-    lines = ["[features]", "multi_agent = true", ""]
+    lines = ["[features]", "multi_agent = true"]
+    if remote_mcp_server is not None:
+        lines.append("shell_tool = false")
+    lines.append("")
     if remote_mcp_server is not None:
         url = str(remote_mcp_server.url).replace("\\", "\\\\").replace('"', '\\"')
         lines += [
+            "[tools]",
+            "exec_command = false",
+            "shell_tool = false",
+            "apply_patch = false",
+            "web_search = false",
+            "",
             "[mcp_servers.ale_sandbox]",
             f'url = "{url}"',
             'bearer_token_env_var = "EVAL_SERVICE_API_KEY"',
@@ -127,6 +136,47 @@ def _codex_project_config(
     cfg = workspace / ".codex" / "config.toml"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text("\n".join(lines), encoding="utf-8")
+    if remote_mcp_server is not None and agents_root.is_dir():
+        # Native Codex subagents do not consistently inherit a project-level
+        # MCP server across releases. Bind the session-scoped server directly
+        # in every selected task agent and make its local workspace read-only.
+        # This prevents a specialist from silently writing the empty local
+        # command workspace when it should be acting in the hosted ALE sandbox.
+        mcp_block = "\n".join([
+            "",
+            "[mcp_servers.ale_sandbox]",
+            f'url = "{url}"',
+            'bearer_token_env_var = "EVAL_SERVICE_API_KEY"',
+            "required = true",
+            'default_tools_approval_mode = "approve"',
+            "startup_timeout_sec = 60",
+            "tool_timeout_sec = 3600",
+            "",
+        ])
+        for toml in sorted(agents_root.rglob("*.toml")):
+            text = toml.read_text(encoding="utf-8")
+            text = re.sub(
+                r"(?m)^(exec_command|shell_tool|apply_patch)\s*=\s*true\s*$",
+                lambda match: f"{match.group(1)} = false",
+                text,
+            )
+            if not re.search(r"(?m)^sandbox_mode\s*=", text):
+                text = 'sandbox_mode = "read-only"\n' + text
+            if "[mcp_servers.ale_sandbox]" not in text:
+                features = re.search(
+                    r"(?ms)^\[features\][^\n]*\n(.*?)(?=^\[|\Z)", text
+                )
+                if features is None:
+                    text = text.rstrip() + "\n\n[features]\nshell_tool = false\n"
+                elif not re.search(r"(?m)^shell_tool\s*=", features.group(1)):
+                    text = re.sub(
+                        r"(?m)^\[features\]\s*$",
+                        "[features]\nshell_tool = false",
+                        text,
+                        count=1,
+                    )
+                text = text.rstrip() + mcp_block
+            toml.write_text(text, encoding="utf-8")
 
 
 def materialize_task_workspace(
